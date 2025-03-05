@@ -4,6 +4,7 @@ from .base_model import BaseModel
 from . import networks
 from .patchnce import PatchNCELoss
 import util.util as util
+import torch.nn.functional as F
 
 
 class CUTModel(BaseModel):
@@ -35,6 +36,11 @@ class CUTModel(BaseModel):
         parser.add_argument('--flip_equivariance',
                             type=util.str2bool, nargs='?', const=True, default=False,
                             help="Enforce flip-equivariance as additional regularization. It's used by FastCUT, but not CUT")
+        
+        # Add new options for eye color and skin tone preservation
+        parser.add_argument('--lambda_eye', type=float, default=10.0, help='weight for eye color preservation loss')
+        parser.add_argument('--lambda_skin', type=float, default=5.0, help='weight for skin tone preservation loss')
+        parser.add_argument('--use_face_parser', type=util.str2bool, default=True, help='use face parsing model for precise feature extraction')
 
         parser.set_defaults(pool_size=0)  # no image pooling
 
@@ -61,6 +67,12 @@ class CUTModel(BaseModel):
         self.loss_names = ['G_GAN', 'D_real', 'D_fake', 'G', 'NCE']
         self.visual_names = ['real_A', 'fake_B', 'real_B']
         self.nce_layers = [int(i) for i in self.opt.nce_layers.split(',')]
+
+        # Add new losses for eye color and skin tone preservation
+        if opt.lambda_eye > 0.0:
+            self.loss_names.append('eye')
+        if opt.lambda_skin > 0.0:
+            self.loss_names.append('skin')
 
         if opt.nce_idt and self.isTrain:
             self.loss_names += ['NCE_Y']
@@ -90,6 +102,26 @@ class CUTModel(BaseModel):
             self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
             self.optimizers.append(self.optimizer_G)
             self.optimizers.append(self.optimizer_D)
+            
+            # Initialize face parser if needed
+            if (opt.lambda_eye > 0.0 or opt.lambda_skin > 0.0) and opt.use_face_parser:
+                try:
+                    from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
+                    self.has_face_parser = True
+                    self.face_processor = SegformerImageProcessor.from_pretrained("jonathandinu/face-parsing")
+                    self.face_model = SegformerForSemanticSegmentation.from_pretrained("jonathandinu/face-parsing")
+                    self.face_model.to(self.device)
+                    print("Face parsing model loaded successfully")
+                    
+                    # Define label indices from the face parser
+                    self.skin_label = 1
+                    self.left_eye_label = 4
+                    self.right_eye_label = 5
+                except ImportError:
+                    print("Warning: transformers package not found. Using simple region-based extraction instead.")
+                    self.has_face_parser = False
+            else:
+                self.has_face_parser = False
 
     def data_dependent_initialize(self, data):
         """
@@ -143,6 +175,158 @@ class CUTModel(BaseModel):
         self.real_B = input['B' if AtoB else 'A'].to(self.device)
         self.image_paths = input['A_paths' if AtoB else 'B_paths']
 
+    def get_face_parsing_masks(self, img):
+        """Extract face parsing masks using the segformer model with caching"""
+        # Create a cache key based on the image tensor data
+        cache_key = hash(img.cpu().detach().numpy().tobytes())
+        
+        # If we already processed this exact image, return cached result
+        if hasattr(self, 'face_parsing_cache') and cache_key in self.face_parsing_cache:
+            return self.face_parsing_cache[cache_key]
+        
+        # If not in cache, process the image
+        batch_size = img.size(0)
+        img_np = img.detach().cpu().numpy().transpose(0, 2, 3, 1)  # BCHW -> BHWC
+        img_np = (img_np + 1) * 127.5  # [-1,1] -> [0,255]
+        img_np = np.clip(img_np, 0, 255).astype(np.uint8)
+        
+        # Process each image in the batch and get segmentation masks
+        all_masks = []
+        
+        for i in range(batch_size):
+            # Convert to PIL Image
+            from PIL import Image
+            pil_img = Image.fromarray(img_np[i])
+            
+            # Process through face parser
+            inputs = self.face_processor(images=pil_img, return_tensors="pt").to(self.device)
+            outputs = self.face_model(**inputs)
+            logits = outputs.logits
+            
+            # Resize output to match input image dimensions
+            upsampled_logits = F.interpolate(
+                logits,
+                size=(img.size(2), img.size(3)),  # H x W
+                mode='bilinear',
+                align_corners=False
+            )
+            
+            # Get label masks
+            masks = upsampled_logits.argmax(dim=1)  # Shape: [1, H, W]
+            all_masks.append(masks)
+            
+        # Combine all masks into a batch
+        batch_masks = torch.cat(all_masks, dim=0)  # Shape: [B, H, W]
+        
+        # Cache the result
+        if hasattr(self, 'face_parsing_cache'):
+            self.face_parsing_cache[cache_key] = batch_masks
+        
+        return batch_masks
+
+    def extract_eye_regions(self, img):
+        """Extract eye regions from an image using face parsing or simple heuristic"""
+        if self.has_face_parser:
+            # Get face parsing masks
+            masks = self.get_face_parsing_masks(img)
+            
+            # Create eye mask (combine left and right eyes)
+            eye_mask = ((masks == self.left_eye_label) | (masks == self.right_eye_label)).float().unsqueeze(1)
+            
+            # Apply mask to the original image to get only eye regions
+            eye_regions = img * eye_mask
+            
+            # Return the masked image
+            return eye_regions
+        else:
+            # Fallback to simple heuristic
+            b, c, h, w = img.size()
+            eye_region = img[:, :, h//5:h//2, w//4:3*w//4]
+            return F.interpolate(eye_region, size=(64, 128), mode='bilinear')
+
+    def extract_skin_regions(self, img):
+        """Extract skin regions from an image using face parsing or simple heuristic"""
+        if self.has_face_parser:
+            # Get face parsing masks
+            masks = self.get_face_parsing_masks(img)
+            
+            # Create skin mask
+            skin_mask = (masks == self.skin_label).float().unsqueeze(1)
+            
+            # Apply mask to get skin regions
+            skin_regions = img * skin_mask
+            
+            return skin_regions
+        else:
+            # Fallback to simple heuristic
+            b, c, h, w = img.size()
+            return img[:, :, h//4:3*h//4, w//4:3*w//4]
+
+    def compute_eye_color_loss(self, src, tgt):
+        """Calculate loss for preserving eye color"""
+        src_eyes = self.extract_eye_regions(src)
+        tgt_eyes = self.extract_eye_regions(tgt)
+        
+        # For the face parser method, we need to handle potential empty masks
+        if self.has_face_parser:
+            # Create binary mask of non-zero pixels (where eyes were detected)
+            src_mask = (torch.sum(src_eyes, dim=1, keepdim=True) != 0).float()
+            tgt_mask = (torch.sum(tgt_eyes, dim=1, keepdim=True) != 0).float()
+            
+            # Combine masks - we only consider pixels where both source and target detected eyes
+            combined_mask = src_mask * tgt_mask
+            
+            # If no eye pixels are detected, return zero loss
+            if combined_mask.sum() < 1.0:
+                return torch.tensor(0.0, device=self.device)
+            
+            # Apply combined mask to both images
+            src_eyes_masked = src_eyes * combined_mask
+            tgt_eyes_masked = tgt_eyes * combined_mask
+            
+            # Calculate mean color of eye regions for more stable comparison
+            src_mean = torch.sum(src_eyes_masked, dim=[2, 3]) / (combined_mask.sum() + 1e-6)
+            tgt_mean = torch.sum(tgt_eyes_masked, dim=[2, 3]) / (combined_mask.sum() + 1e-6)
+            
+            # Compare overall color distributions and local details
+            color_loss = F.l1_loss(src_mean, tgt_mean)
+            detail_loss = F.l1_loss(src_eyes_masked, tgt_eyes_masked) 
+            
+            return color_loss * 0.7 + detail_loss * 0.3
+        else:
+            # Simple L1 loss for heuristic method
+            return F.l1_loss(src_eyes, tgt_eyes)
+
+    def compute_skin_tone_loss(self, src, tgt):
+        """Calculate loss for preserving skin tone"""
+        src_skin = self.extract_skin_regions(src)
+        tgt_skin = self.extract_skin_regions(tgt)
+        
+        if self.has_face_parser:
+            # Create binary mask of non-zero pixels (where skin was detected)
+            src_mask = (torch.sum(src_skin, dim=1, keepdim=True) != 0).float()
+            tgt_mask = (torch.sum(tgt_skin, dim=1, keepdim=True) != 0).float()
+            
+            # Combine masks
+            combined_mask = src_mask * tgt_mask
+            
+            # If no skin pixels are detected, return zero loss
+            if combined_mask.sum() < 1.0:
+                return torch.tensor(0.0, device=self.device)
+            
+            # Calculate color statistics on masked regions
+            src_mean = torch.sum(src_skin * combined_mask, dim=[2, 3]) / torch.sum(combined_mask, dim=[2, 3])
+            tgt_mean = torch.sum(tgt_skin * combined_mask, dim=[2, 3]) / torch.sum(combined_mask, dim=[2, 3])
+            
+            # Compare color distributions
+            return F.l1_loss(src_mean, tgt_mean)
+        else:
+            # Simple color statistics for heuristic method
+            src_mean = torch.mean(src_skin, dim=[2, 3])  # Average over spatial dimensions
+            tgt_mean = torch.mean(tgt_skin, dim=[2, 3])
+            
+            return F.l1_loss(src_mean, tgt_mean)
+
     def forward(self):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
         self.real = torch.cat((self.real_A, self.real_B), dim=0) if self.opt.nce_idt and self.opt.isTrain else self.real_A
@@ -150,6 +334,10 @@ class CUTModel(BaseModel):
             self.flipped_for_equivariance = self.opt.isTrain and (np.random.random() < 0.5)
             if self.flipped_for_equivariance:
                 self.real = torch.flip(self.real, [3])
+
+        # Clear the face parsing cache at the beginning of each forward pass
+        if hasattr(self, 'has_face_parser') and self.has_face_parser:
+            self.face_parsing_cache = {}
 
         self.fake = self.netG(self.real)
         self.fake_B = self.fake[:self.real_A.size(0)]
@@ -191,8 +379,20 @@ class CUTModel(BaseModel):
             loss_NCE_both = (self.loss_NCE + self.loss_NCE_Y) * 0.5
         else:
             loss_NCE_both = self.loss_NCE
+            
+        # Calculate eye color preservation loss
+        if self.opt.lambda_eye > 0.0:
+            self.loss_eye = self.compute_eye_color_loss(self.real_A, self.fake_B) * self.opt.lambda_eye
+        else:
+            self.loss_eye = 0.0
+            
+        # Calculate skin tone preservation loss
+        if self.opt.lambda_skin > 0.0:
+            self.loss_skin = self.compute_skin_tone_loss(self.real_A, self.fake_B) * self.opt.lambda_skin
+        else:
+            self.loss_skin = 0.0
 
-        self.loss_G = self.loss_G_GAN + loss_NCE_both
+        self.loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_eye + self.loss_skin
         return self.loss_G
 
     def calculate_NCE_loss(self, src, tgt):

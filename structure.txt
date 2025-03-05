@@ -1,0 +1,59 @@
+.
+├── data
+│   ├── base_dataset.py
+│   ├── image_folder.py
+│   ├── __init__.py
+│   ├── single_dataset.py
+│   ├── singleimage_dataset.py
+│   ├── template_dataset.py
+│   └── unaligned_dataset.py
+├── docs
+│   └── datasets.md
+├── environment.yml
+├── experiments
+│   ├── grumpifycat_launcher.py
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── placeholder_launcher.py
+│   ├── pretrained_launcher.py
+│   ├── singleimage_launcher.py
+│   └── tmux_launcher.py
+├── imgs
+│   ├── gif_cut.gif
+│   ├── grumpycat.jpg
+│   ├── horse2zebra_comparison.jpg
+│   ├── paris.jpg
+│   ├── patchnce.gif
+│   ├── results.gif
+│   └── singleimage.gif
+├── LICENSE
+├── models
+│   ├── base_model.py
+│   ├── cut_model.py
+│   ├── cycle_gan_model.py
+│   ├── __init__.py
+│   ├── networks.py
+│   ├── patchnce.py
+│   ├── sincut_model.py
+│   ├── stylegan_networks.py
+│   └── template_model.py
+├── options
+│   ├── base_options.py
+│   ├── __init__.py
+│   ├── test_options.py
+│   └── train_options.py
+├── README.md
+├── requirements.txt
+├── structure.txt
+├── test.py
+├── tox.ini
+├── train.py
+└── util
+    ├── get_data.py
+    ├── html.py
+    ├── image_pool.py
+    ├── __init__.py
+    ├── util.py
+    └── visualizer.py
+
+8 directories, 49 files
