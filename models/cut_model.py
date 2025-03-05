@@ -431,8 +431,7 @@ class CUTModel(BaseModel):
         src_masks = self.get_face_parsing_masks(src)
         tgt_masks = self.get_face_parsing_masks(tgt)
         
-        # For identical images, if the face parser is deterministic,
-        # these masks should be identical
+        # Calculate pixel accuracy (percent of pixels with matching labels)
         mask_equals = (src_masks == tgt_masks).float()
         pixel_acc = mask_equals.mean()
         
@@ -443,17 +442,42 @@ class CUTModel(BaseModel):
         src_one_hot = F.one_hot(src_masks, num_classes).permute(0, 3, 1, 2).float()
         tgt_one_hot = F.one_hot(tgt_masks, num_classes).permute(0, 3, 1, 2).float()
         
-        # Calculate IoU for each class
+        # Check which classes are present in each image
+        src_classes_present = (torch.sum(src_one_hot, dim=[2, 3]) > 0) # Shape: [batch_size, num_classes]
+        tgt_classes_present = (torch.sum(tgt_one_hot, dim=[2, 3]) > 0)
+        
+        # Identify classes present in source but missing in target
+        # This directly penalizes when target masks don't have features from source masks
+        missing_classes = src_classes_present & ~tgt_classes_present
+        
+        # Define importance weights for different facial features
+        class_weights = torch.ones(num_classes, device=self.device)
+        # Increase weights for important facial features
+        class_weights[2] = 2.0    # nose
+        class_weights[5] = 2.0    # Right eye
+        class_weights[4] = 2.0   # left eye
+        class_weights[10] = 2.0   # Mouth
+        class_weights[3] = 2.0    # Glasses (eye_g)
+        class_weights[15] = 2.0   # Earrings
+        class_weights[16] = 2.0   # Earrings
+        
+        # Calculate missing feature penalty with importance weighting
+        # Sum across the classes dimension, then average across batch
+        missing_feature_penalty = ((missing_classes.float() * class_weights).sum(dim=1) / 
+                                  (src_classes_present.float() * class_weights).sum(dim=1).clamp(min=1e-6)).mean()
+        
+        # Calculate IoU for each class (for classes present in source)
         intersection = torch.sum(src_one_hot * tgt_one_hot, dim=[2, 3])
         union = torch.sum(src_one_hot, dim=[2, 3]) + torch.sum(tgt_one_hot, dim=[2, 3]) - intersection
         
-        # Only consider classes that are present in the source image
-        valid_mask = (torch.sum(src_one_hot, dim=[2, 3]) > 0)
-        
-        # Calculate IoU only for classes that are present
+        # Calculate IoU only for classes that are present in source
         iou = torch.zeros_like(intersection)
-        iou[valid_mask] = intersection[valid_mask] / (union[valid_mask] + 1e-6)
-        mean_iou = iou.sum() / (valid_mask.sum() + 1e-6)
+        iou[src_classes_present] = intersection[src_classes_present] / (union[src_classes_present] + 1e-6)
+        weighted_iou = (iou * class_weights).sum(dim=1) / (src_classes_present.float() * class_weights).sum(dim=1).clamp(min=1e-6)
+        mean_weighted_iou = weighted_iou.mean()
         
-        # The loss is 1 - accuracy
-        return 1.0 - (0.5 * pixel_acc + 0.5 * mean_iou)
+        # Combined loss: pixel accuracy, IoU, and missing feature penalty
+        # Higher weight on missing feature penalty to emphasize feature preservation
+        final_loss = 0.2 * (1.0 - pixel_acc) + 0.3 * (1.0 - mean_weighted_iou) + 0.5 * missing_feature_penalty
+        
+        return final_loss
