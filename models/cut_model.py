@@ -38,9 +38,10 @@ class CUTModel(BaseModel):
                             help="Enforce flip-equivariance as additional regularization. It's used by FastCUT, but not CUT")
         
         # Add new options for eye color and skin tone preservation
-        parser.add_argument('--lambda_eye', type=float, default=10.0, help='weight for eye color preservation loss')
-        parser.add_argument('--lambda_skin', type=float, default=5.0, help='weight for skin tone preservation loss')
+        parser.add_argument('--lambda_eye', type=float, default=5.0, help='weight for eye color preservation loss')
+        parser.add_argument('--lambda_skin', type=float, default=1.0, help='weight for skin tone preservation loss')
         parser.add_argument('--use_face_parser', type=util.str2bool, default=True, help='use face parsing model for precise feature extraction')
+        parser.add_argument('--lambda_segmentation', type=float, default=5.0, help='weight for segmentation consistency loss')
 
         parser.set_defaults(pool_size=0)  # no image pooling
 
@@ -73,6 +74,9 @@ class CUTModel(BaseModel):
             self.loss_names.append('eye')
         if opt.lambda_skin > 0.0:
             self.loss_names.append('skin')
+        # Add segmentation loss
+        if opt.lambda_segmentation > 0.0:
+            self.loss_names.append('segmentation')
 
         if opt.nce_idt and self.isTrain:
             self.loss_names += ['NCE_Y']
@@ -390,8 +394,14 @@ class CUTModel(BaseModel):
             self.loss_skin = self.compute_skin_tone_loss(self.real_A, self.fake_B) * self.opt.lambda_skin
         else:
             self.loss_skin = 0.0
+            
+        # Calculate segmentation consistency loss
+        if self.opt.lambda_segmentation > 0.0:
+            self.loss_segmentation = self.compute_segmentation_loss(self.real_A, self.fake_B) * self.opt.lambda_segmentation
+        else:
+            self.loss_segmentation = 0.0
 
-        self.loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_eye + self.loss_skin
+        self.loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_eye + self.loss_skin + self.loss_segmentation
         return self.loss_G
 
     def calculate_NCE_loss(self, src, tgt):
@@ -411,3 +421,39 @@ class CUTModel(BaseModel):
             total_nce_loss += loss.mean()
 
         return total_nce_loss / n_layers
+
+    def compute_segmentation_loss(self, src, tgt):
+        """Calculate loss to ensure consistent segmentation masks between source and target"""
+        if not self.has_face_parser:
+            return torch.tensor(0.0, device=self.device)
+            
+        # Get segmentation masks for source and generated images
+        src_masks = self.get_face_parsing_masks(src)
+        tgt_masks = self.get_face_parsing_masks(tgt)
+        
+        # For identical images, if the face parser is deterministic,
+        # these masks should be identical
+        mask_equals = (src_masks == tgt_masks).float()
+        pixel_acc = mask_equals.mean()
+        
+        # Convert to one-hot for class-wise calculations
+        batch_size, height, width = src_masks.size()
+        num_classes = 19  # Number of classes in face-parsing model
+        
+        src_one_hot = F.one_hot(src_masks, num_classes).permute(0, 3, 1, 2).float()
+        tgt_one_hot = F.one_hot(tgt_masks, num_classes).permute(0, 3, 1, 2).float()
+        
+        # Calculate IoU for each class
+        intersection = torch.sum(src_one_hot * tgt_one_hot, dim=[2, 3])
+        union = torch.sum(src_one_hot, dim=[2, 3]) + torch.sum(tgt_one_hot, dim=[2, 3]) - intersection
+        
+        # Only consider classes that are present in the source image
+        valid_mask = (torch.sum(src_one_hot, dim=[2, 3]) > 0)
+        
+        # Calculate IoU only for classes that are present
+        iou = torch.zeros_like(intersection)
+        iou[valid_mask] = intersection[valid_mask] / (union[valid_mask] + 1e-6)
+        mean_iou = iou.sum() / (valid_mask.sum() + 1e-6)
+        
+        # The loss is 1 - accuracy
+        return 1.0 - (0.5 * pixel_acc + 0.5 * mean_iou)

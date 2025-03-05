@@ -61,6 +61,7 @@ class MockOptions:
         self.beta2 = 0.999
         self.batch_size = 1
         self.preprocess = 'resize_and_crop'
+        self.lambda_segmentation = 10.0
 
 
 class TestCUTModel(unittest.TestCase):
@@ -117,8 +118,15 @@ class TestCUTModel(unittest.TestCase):
             draw2.ellipse((150, 80, 180, 100), fill=(120, 80, 40))
             img2.save(face1_2_path)
 
-    def load_test_images(self):
-        """Load test images into tensors"""
+    def load_test_images(self, *images):
+        """Load test images into tensors
+        
+        Args:
+            *images: Image filenames to load. If none provided, defaults to ['face1.jpg', 'face1_2.jpg']
+        
+        Returns:
+            tuple: Tensor(s) of the loaded image(s)
+        """
         from PIL import Image
         import torchvision.transforms as transforms
         
@@ -128,18 +136,27 @@ class TestCUTModel(unittest.TestCase):
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
         
-        face1 = Image.open('models/tests/images/face1.jpg').convert('RGB')
-        face1_2 = Image.open('models/tests/images/face1_2.jpg').convert('RGB')
+        # Default to face1.jpg and face1_2.jpg if no images specified
+        if not images:
+            images = ['face1.jpg', 'face1_2.jpg']
         
-        face1_tensor = transform(face1).unsqueeze(0)
-        face1_2_tensor = transform(face1_2).unsqueeze(0)
+        tensors = []
+        for img_name in images:
+            img_path = os.path.join('models/tests/images', img_name)
+            img = Image.open(img_path).convert('RGB')
+            img_tensor = transform(img).unsqueeze(0)
+            
+            # Move tensor to the same device as the model
+            if hasattr(self.model, 'device'):
+                img_tensor = img_tensor.to(self.model.device)
+            
+            tensors.append(img_tensor)
         
-        # Move tensors to the same device as the model
-        if hasattr(self.model, 'device'):
-            face1_tensor = face1_tensor.to(self.model.device)
-            face1_2_tensor = face1_2_tensor.to(self.model.device)
-        
-        return face1_tensor, face1_2_tensor
+        # Return a single tensor or a tuple of tensors
+        if len(tensors) == 1:
+            return tensors[0]
+        else:
+            return tuple(tensors)
 
     def test_eye_color_loss(self):
         """Test if eye color loss works properly"""
@@ -411,6 +428,33 @@ class TestCUTModel(unittest.TestCase):
         
         self.assertLess(low_contrast_loss.item(), different_skin_loss.item(),
                        "With low contrast, loss should be lower than with different skin")
+
+    def test_segmentation_loss(self):
+        # Skip test if face parser is not available
+        if not hasattr(self, 'has_face_parser'):
+            self.skipTest("Face parser not initialized")
+        
+        # Load test images
+        face1_tensor, face1_2_tensor = self.load_test_images()
+        face2_tensor = self.load_test_images('face2.jpg')
+        
+        # Set up mock input
+        self.model.real_A = face1_tensor
+        self.model.fake_B = face1_2_tensor
+        
+        # Get masks directly to check equality
+        mask1 = self.model.get_face_parsing_masks(face1_tensor)
+        mask1_again = self.model.get_face_parsing_masks(face1_tensor)
+        
+        # Check if masks are identical for the same image
+        masks_equal = torch.equal(mask1, mask1_again)
+        print(f"Are masks for the same image identical? {masks_equal}")
+        
+        seg_loss = self.model.compute_segmentation_loss(face1_tensor, face1_tensor)
+        print(f"Segmentation loss face1 to face1: {seg_loss.item()}")
+        seg_loss = self.model.compute_segmentation_loss(face1_tensor, face2_tensor)
+        print(f"Segmentation loss face1 to face2: {seg_loss.item()}")
+
 
 
 if __name__ == '__main__':
