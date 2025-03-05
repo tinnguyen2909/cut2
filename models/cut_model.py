@@ -297,7 +297,7 @@ class CUTModel(BaseModel):
             return torch.tensor(0.0, device=self.device)
 
     def compute_skin_tone_loss(self, src, tgt):
-        """Calculate loss for preserving skin tone with robustness to lighting conditions"""
+        """Calculate loss for preserving skin tone"""
         src_skin = self.extract_skin_regions(src)
         tgt_skin = self.extract_skin_regions(tgt)
         
@@ -313,76 +313,18 @@ class CUTModel(BaseModel):
             if combined_mask.sum() < 1.0:
                 return torch.tensor(0.0, device=self.device)
             
-            # Apply masks to original skin regions
-            src_skin_masked = src_skin * combined_mask
-            tgt_skin_masked = tgt_skin * combined_mask
+            # Calculate color statistics on masked regions
+            src_mean = torch.sum(src_skin * combined_mask, dim=[2, 3]) / torch.sum(combined_mask, dim=[2, 3])
+            tgt_mean = torch.sum(tgt_skin * combined_mask, dim=[2, 3]) / torch.sum(combined_mask, dim=[2, 3])
             
-            # Convert to HSV-like representation for better lighting invariance
-            epsilon = 1e-6  # prevent division by zero
-            
-            # Step 1: Calculate color ratios which are highly lighting-invariant
-            # Normalize by intensity sum across channels
-            src_sum = torch.sum(src_skin_masked, dim=1, keepdim=True) + epsilon
-            tgt_sum = torch.sum(tgt_skin_masked, dim=1, keepdim=True) + epsilon
-            
-            src_normalized = src_skin_masked / src_sum
-            tgt_normalized = tgt_skin_masked / tgt_sum
-            
-            # Step 2: Work with normalized skin colors
-            # Calculate mean of normalized color (chromaticity) for overall tone comparison
-            src_mean_norm = torch.sum(src_normalized * combined_mask, dim=[2, 3]) / (torch.sum(combined_mask, dim=[2, 3]) + epsilon)
-            tgt_mean_norm = torch.sum(tgt_normalized * combined_mask, dim=[2, 3]) / (torch.sum(combined_mask, dim=[2, 3]) + epsilon)
-            
-            # Step 3: Calculate channel ratios which are even more lighting-invariant
-            # For extreme lighting, these ratios preserve the fundamental skin tone signature
-            src_r_ratio = src_mean_norm[:, 0] / (src_mean_norm[:, 1] + src_mean_norm[:, 2] + epsilon)
-            tgt_r_ratio = tgt_mean_norm[:, 0] / (tgt_mean_norm[:, 1] + tgt_mean_norm[:, 2] + epsilon)
-            
-            src_g_ratio = src_mean_norm[:, 1] / (src_mean_norm[:, 0] + src_mean_norm[:, 2] + epsilon)
-            tgt_g_ratio = tgt_mean_norm[:, 1] / (tgt_mean_norm[:, 0] + tgt_mean_norm[:, 2] + epsilon)
-            
-            src_b_ratio = src_mean_norm[:, 2] / (src_mean_norm[:, 0] + src_mean_norm[:, 1] + epsilon)
-            tgt_b_ratio = tgt_mean_norm[:, 2] / (tgt_mean_norm[:, 0] + tgt_mean_norm[:, 1] + epsilon)
-            
-            # Step 4: Compare overall chromaticity and color ratios
-            chromaticity_loss = F.l1_loss(src_mean_norm, tgt_mean_norm)
-            ratio_loss = (F.l1_loss(src_r_ratio, tgt_r_ratio) + 
-                          F.l1_loss(src_g_ratio, tgt_g_ratio) + 
-                          F.l1_loss(src_b_ratio, tgt_b_ratio)) / 3.0
-            
-            # For extreme lighting conditions, rely more on the color ratios than direct comparison
-            # Use an adaptive weighting strategy based on lighting condition detection
-            
-            # Detect extreme lighting by analyzing brightness variance
-            src_brightness = torch.mean(src_skin_masked, dim=1)
-            tgt_brightness = torch.mean(tgt_skin_masked, dim=1)
-            
-            # Calculate if either image has extreme lighting (very dark, very bright, or low contrast)
-            src_mean_brightness = torch.mean(src_brightness[combined_mask[:, 0] > 0])
-            tgt_mean_brightness = torch.mean(tgt_brightness[combined_mask[:, 0] > 0])
-            
-            src_brightness_std = torch.std(src_brightness[combined_mask[:, 0] > 0]) 
-            tgt_brightness_std = torch.std(tgt_brightness[combined_mask[:, 0] > 0])
-            
-            # Detect extreme lighting conditions
-            is_extreme_lighting = ((src_mean_brightness < 0.2) or (src_mean_brightness > 0.8) or
-                                  (tgt_mean_brightness < 0.2) or (tgt_mean_brightness > 0.8) or
-                                  (src_brightness_std < 0.05) or (tgt_brightness_std < 0.05))
-            
-            # Adjust weights based on lighting conditions
-            if is_extreme_lighting:
-                # In extreme lighting, rely more on color ratios and less on direct comparison
-                chromaticity_weight = 0.2
-                ratio_weight = 0.8
-            else:
-                # In normal lighting, balanced approach
-                chromaticity_weight = 0.6
-                ratio_weight = 0.4
-            
-            # Calculate weighted loss
-            return chromaticity_loss * chromaticity_weight + ratio_loss * ratio_weight
+            # Compare color distributions
+            return F.l1_loss(src_mean, tgt_mean)
         else:
-            return torch.tensor(0.0, device=self.device)
+            # Simple color statistics for heuristic method
+            src_mean = torch.mean(src_skin, dim=[2, 3])  # Average over spatial dimensions
+            tgt_mean = torch.mean(tgt_skin, dim=[2, 3])
+            
+            return F.l1_loss(src_mean, tgt_mean)
 
     def forward(self):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
