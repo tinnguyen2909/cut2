@@ -24,16 +24,29 @@ class UnalignedDataset(BaseDataset):
             opt (Option class) -- stores all the experiment flags; needs to be a subclass of BaseOptions
         """
         BaseDataset.__init__(self, opt)
-        self.dir_A = os.path.join(opt.dataroot, opt.phase + 'A')  # create a path '/path/to/data/trainA'
-        self.dir_B = os.path.join(opt.dataroot, opt.phase + 'B')  # create a path '/path/to/data/trainB'
-
-        if opt.phase == "test" and not os.path.exists(self.dir_A) \
-           and os.path.exists(os.path.join(opt.dataroot, "valA")):
-            self.dir_A = os.path.join(opt.dataroot, "valA")
-            self.dir_B = os.path.join(opt.dataroot, "valB")
-
-        self.A_paths = sorted(make_dataset(self.dir_A, opt.max_dataset_size))   # load images from '/path/to/data/trainA'
-        self.B_paths = sorted(make_dataset(self.dir_B, opt.max_dataset_size))    # load images from '/path/to/data/trainB'
+        
+        # Parse comma-separated directory strings
+        self.dir_A_list = [dir.strip() for dir in opt.path_A.split(',')]
+        self.dir_B_list = [dir.strip() for dir in opt.path_B.split(',')]
+        
+        # Load images from all directories for domain A
+        self.A_paths = []
+        for dir_A in self.dir_A_list:
+            if os.path.exists(dir_A):
+                paths = sorted(make_dataset(dir_A, opt.max_dataset_size - len(self.A_paths)))
+                self.A_paths.extend(paths)
+                if len(self.A_paths) >= opt.max_dataset_size:
+                    break
+        
+        # Load images from all directories for domain B
+        self.B_paths = []
+        for dir_B in self.dir_B_list:
+            if os.path.exists(dir_B):
+                paths = sorted(make_dataset(dir_B, opt.max_dataset_size - len(self.B_paths)))
+                self.B_paths.extend(paths)
+                if len(self.B_paths) >= opt.max_dataset_size:
+                    break
+        
         self.A_size = len(self.A_paths)  # get the size of dataset A
         self.B_size = len(self.B_paths)  # get the size of dataset B
 
