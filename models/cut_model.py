@@ -48,6 +48,9 @@ class CUTModel(BaseModel):
         parser.add_argument('--lambda_color_consistency', type=float, default=3.0, help='weight for color consistency loss to prevent bleeding')
         parser.add_argument('--edge_threshold', type=float, default=0.05, help='threshold for detecting important edges')
 
+        # Add option for ethnicity preservation
+        parser.add_argument('--lambda_ethnicity', type=float, default=2.0, help='weight for ethnicity preservation loss')
+
         parser.set_defaults(pool_size=0)  # no image pooling
 
         opt, _ = parser.parse_known_args()
@@ -88,6 +91,9 @@ class CUTModel(BaseModel):
             self.loss_names.append('edge')
         if opt.lambda_color_consistency > 0.0:
             self.loss_names.append('color')
+        # Add ethnicity preservation loss
+        if opt.lambda_ethnicity > 0.0:
+            self.loss_names.append('ethnicity')
 
         if opt.nce_idt and self.isTrain:
             self.loss_names += ['NCE_Y']
@@ -145,6 +151,10 @@ class CUTModel(BaseModel):
                 sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).reshape(1, 1, 3, 3)
                 self.sobel_x = sobel_x.to(self.device)
                 self.sobel_y = sobel_y.to(self.device)
+
+            # Initialize race prediction model
+            self.race_model = None
+            self.race_model_loaded = False
 
     def data_dependent_initialize(self, data):
         """
@@ -558,9 +568,15 @@ class CUTModel(BaseModel):
             self.loss_color = self.compute_color_consistency_loss(self.real_A, self.fake_B) * self.opt.lambda_color_consistency
         else:
             self.loss_color = 0.0
+            
+        # Calculate ethnicity preservation loss
+        if self.opt.lambda_ethnicity > 0.0:
+            self.loss_ethnicity = self.compute_ethnicity_preservation_loss(self.real_A, self.fake_B) * self.opt.lambda_ethnicity
+        else:
+            self.loss_ethnicity = 0.0
 
         self.loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_eye + self.loss_skin + \
-                     self.loss_segmentation + self.loss_edge + self.loss_color
+                     self.loss_segmentation + self.loss_edge + self.loss_color + self.loss_ethnicity
         return self.loss_G
 
     def calculate_NCE_loss(self, src, tgt):
@@ -640,3 +656,102 @@ class CUTModel(BaseModel):
         final_loss = 0.2 * (1.0 - pixel_acc) + 0.3 * (1.0 - mean_weighted_iou) + 0.5 * missing_feature_penalty
         
         return final_loss
+
+    def compute_ethnicity_preservation_loss(self, source, target):
+        """Compute ethnicity preservation loss to keep the same race/ethnicity between source and target
+        
+        Args:
+            source (tensor): Source image tensor
+            target (tensor): Target image tensor
+            
+        Returns:
+            tensor: Ethnicity preservation loss
+        """
+        import sys
+        import os
+        
+        # Ensure fairface is in the path
+        fairface_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'fairface')
+        if fairface_dir not in sys.path:
+            sys.path.append(fairface_dir)
+            
+        try:
+            from fairface.predict_race import load_model
+            import torch
+            import torch.nn.functional as F
+            import torchvision.transforms as transforms
+        except ImportError:
+            print("Error importing FairFace modules. Make sure the fairface directory is properly set up.")
+            return torch.tensor(0.0, device=source.device)
+        
+        # Lazy-load the race prediction model on first use
+        if not hasattr(self, 'race_model') or self.race_model is None:
+            try:
+                # Import required components from FairFace
+                import torchvision.models as models
+                import torch.nn as nn
+                
+                # Initialize the race model
+                device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                self.race_model = models.resnet34(pretrained=True)
+                self.race_model.fc = nn.Linear(self.race_model.fc.in_features, 18)
+                models_path = os.path.join(fairface_dir, 'models')
+                model_path = os.path.join(models_path, 'res34_fair_align_multi_4_20190809.pt')
+                self.race_model.load_state_dict(torch.load(model_path))
+                self.race_model = self.race_model.to(device)
+                self.race_model.eval()
+                print("FairFace race prediction model loaded successfully.")
+            except Exception as e:
+                print(f"Error loading race prediction model: {e}")
+                return torch.tensor(0.0, device=source.device)
+            
+        # Define the image transformation
+        trans = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        # Process images in batches
+        batch_size = source.size(0)
+        loss = 0.0
+        
+        # Set model to evaluation mode
+        self.race_model.eval()
+        
+        with torch.no_grad():
+            for i in range(batch_size):
+                # Extract and prepare single images
+                src_img = trans(source[i:i+1])  # Keep batch dimension
+                tgt_img = trans(target[i:i+1])  # Keep batch dimension
+                
+                # Get race predictions
+                src_outputs = self.race_model(src_img)
+                tgt_outputs = self.race_model(tgt_img)
+                
+                # Extract race logits from outputs (first 4 classes are for race)
+                src_race_logits = src_outputs[:, :4]
+                tgt_race_logits = tgt_outputs[:, :4]
+                
+                # Get probabilities
+                src_race_probs = F.softmax(src_race_logits, dim=1)
+                tgt_race_probs = F.softmax(tgt_race_logits, dim=1)
+                
+                # Calculate KL divergence loss between distributions
+                kl_loss = F.kl_div(
+                    F.log_softmax(tgt_race_logits, dim=1),
+                    src_race_probs,
+                    reduction='batchmean'
+                )
+                
+                # Calculate L1 loss between probability distributions
+                l1_loss = F.l1_loss(tgt_race_probs, src_race_probs)
+                
+                # Combine losses
+                img_loss = 0.5 * kl_loss + 0.5 * l1_loss
+                loss += img_loss
+                
+        # Average loss over batch
+        if batch_size > 0:
+            loss = loss / batch_size
+            
+        return loss
