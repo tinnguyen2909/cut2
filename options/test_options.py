@@ -15,6 +15,9 @@ class TestOptions(BaseOptions):
         parser.add_argument('--eval', action='store_true', help='use eval mode during test time.')
         parser.add_argument('--num_test', type=int, default=50, help='how many test images to run')
 
+        parser.add_argument('--path_A', type=str, default='', help='comma-separated list of directories with A images')
+        parser.add_argument('--path_B', type=str, default='', help='comma-separated list of directories with B images')
+
         # To avoid cropping, the load_size should be the same as crop_size
         parser.set_defaults(load_size=parser.get_default('crop_size'))
         self.isTrain = False

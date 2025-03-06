@@ -43,6 +43,11 @@ class CUTModel(BaseModel):
         parser.add_argument('--use_face_parser', type=util.str2bool, default=True, help='use face parsing model for precise feature extraction')
         parser.add_argument('--lambda_segmentation', type=float, default=5.0, help='weight for segmentation consistency loss')
 
+        # Add new options for edge preservation and color consistency
+        parser.add_argument('--lambda_edge', type=float, default=5.0, help='weight for edge preservation loss')
+        parser.add_argument('--lambda_color_consistency', type=float, default=3.0, help='weight for color consistency loss to prevent bleeding')
+        parser.add_argument('--edge_threshold', type=float, default=0.05, help='threshold for detecting important edges')
+
         parser.set_defaults(pool_size=0)  # no image pooling
 
         opt, _ = parser.parse_known_args()
@@ -77,6 +82,12 @@ class CUTModel(BaseModel):
         # Add segmentation loss
         if opt.lambda_segmentation > 0.0:
             self.loss_names.append('segmentation')
+
+        # Add new losses for edge preservation and color consistency
+        if opt.lambda_edge > 0.0:
+            self.loss_names.append('edge')
+        if opt.lambda_color_consistency > 0.0:
+            self.loss_names.append('color')
 
         if opt.nce_idt and self.isTrain:
             self.loss_names += ['NCE_Y']
@@ -126,6 +137,14 @@ class CUTModel(BaseModel):
                     self.has_face_parser = False
             else:
                 self.has_face_parser = False
+
+            # Register Sobel filters for edge detection
+            if opt.lambda_edge > 0.0:
+                # Define Sobel filters - note the shape change
+                sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).reshape(1, 1, 3, 3)
+                sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).reshape(1, 1, 3, 3)
+                self.sobel_x = sobel_x.to(self.device)
+                self.sobel_y = sobel_y.to(self.device)
 
     def data_dependent_initialize(self, data):
         """
@@ -362,6 +381,133 @@ class CUTModel(BaseModel):
         self.loss_D = (self.loss_D_fake + self.loss_D_real) * 0.5
         return self.loss_D
 
+    def detect_edges(self, img):
+        """Detect edges using Sobel filters"""
+        # Convert to grayscale for edge detection
+        if img.size(1) == 3:  # If image has 3 channels (RGB)
+            # Convert to grayscale: 0.299 * R + 0.587 * G + 0.114 * B
+            gray = 0.299 * img[:, 0:1] + 0.587 * img[:, 1:2] + 0.114 * img[:, 2:3]
+        else:
+            gray = img
+        
+        # Pad the input to maintain size after convolution
+        padded = F.pad(gray, (1, 1, 1, 1), mode='reflect')
+        
+        # Apply Sobel filters
+        batch_size = gray.size(0)
+        
+        # Process each channel separately
+        grad_x = F.conv2d(padded, weight=self.sobel_x, groups=1)
+        grad_y = F.conv2d(padded, weight=self.sobel_y, groups=1)
+        
+        # Compute gradient magnitude
+        grad_magnitude = torch.sqrt(grad_x**2 + grad_y**2 + 1e-6)
+        
+        # Normalize
+        grad_magnitude = grad_magnitude / grad_magnitude.max()
+        
+        return grad_magnitude, grad_x, grad_y
+
+    def compute_edge_preservation_loss(self, source, target):
+        """Compute edge preservation loss to maintain important features"""
+        # Detect edges in source and target images
+        source_edges, source_grad_x, source_grad_y = self.detect_edges(source)
+        target_edges, target_grad_x, target_grad_y = self.detect_edges(target)
+        
+        # Identify important edges in source image (using threshold)
+        important_edges = (source_edges > self.opt.edge_threshold).float()
+        
+        # Compute weighted edge preservation loss
+        # This focuses on preserving important edges from source image
+        edge_loss = F.l1_loss(target_edges * important_edges, source_edges * important_edges)
+        
+        # Compute gradient direction consistency loss for important edges
+        # This helps maintain the correct edge orientation
+        eps = 1e-6  # Small value to prevent division by zero
+        source_grad_norm = torch.sqrt(source_grad_x**2 + source_grad_y**2 + eps)
+        target_grad_norm = torch.sqrt(target_grad_x**2 + target_grad_y**2 + eps)
+        
+        source_grad_x_norm = source_grad_x / source_grad_norm
+        source_grad_y_norm = source_grad_y / source_grad_norm
+        target_grad_x_norm = target_grad_x / target_grad_norm
+        target_grad_y_norm = target_grad_y / target_grad_norm
+        
+        # Compute cosine similarity between gradient directions
+        direction_similarity = (source_grad_x_norm * target_grad_x_norm + 
+                              source_grad_y_norm * target_grad_y_norm)
+        
+        # Convert similarity to a loss (1 - similarity)
+        direction_loss = torch.mean((1.0 - direction_similarity) * important_edges)
+        
+        # Combine losses
+        return edge_loss * 0.7 + direction_loss * 0.3
+
+    def compute_color_consistency_loss(self, source, target):
+        """Compute color consistency loss to prevent color bleeding"""
+        # Detect edges to identify boundaries
+        edges, _, _ = self.detect_edges(source)
+        edges = (edges > self.opt.edge_threshold).float()
+        
+        # Dilate edges to create boundary regions
+        kernel_size = 3
+        padding = kernel_size // 2
+        edge_regions = F.max_pool2d(edges, kernel_size=kernel_size, stride=1, padding=padding)
+        
+        # Non-edge regions (where color consistency is enforced more strictly)
+        non_edge_regions = 1.0 - edge_regions
+        
+        # Get color statistics in non-edge regions (mean and variance)
+        # For each channel separately
+        color_loss = 0.0
+        
+        # Process regions using local windows
+        window_size = 7
+        padding = window_size // 2
+        
+        # For efficiency, sample random positions rather than processing every pixel
+        batch_size, channels, height, width = source.size()
+        num_samples = 1000
+        
+        for _ in range(num_samples):
+            # Select random position
+            y = torch.randint(padding, height - padding, (1,)).item()
+            x = torch.randint(padding, width - padding, (1,)).item()
+            
+            # Extract local patches
+            source_patch = source[:, :, y-padding:y+padding+1, x-padding:x+padding+1]
+            target_patch = target[:, :, y-padding:y+padding+1, x-padding:x+padding+1]
+            region_mask = non_edge_regions[:, :, y-padding:y+padding+1, x-padding:x+padding+1]
+            
+            # If the patch is mostly in non-edge region, enforce color consistency
+            if region_mask.mean() > 0.7:  # If more than 70% of patch is non-edge
+                # Calculate color statistics
+                source_mean = torch.mean(source_patch, dim=[2, 3])
+                target_mean = torch.mean(target_patch, dim=[2, 3])
+                
+                source_std = torch.std(source_patch, dim=[2, 3])
+                target_std = torch.std(target_patch, dim=[2, 3])
+                
+                # Color consistency loss
+                color_loss += F.l1_loss(source_mean, target_mean) + 0.5 * F.l1_loss(source_std, target_std)
+        
+        # Normalize by number of samples
+        color_loss = color_loss / num_samples
+        
+        # Check for abrupt color transitions (color bleeding)
+        # Look at adjacent pixels in non-edge regions
+        source_dx = torch.abs(source[:, :, :, 1:] - source[:, :, :, :-1]) * non_edge_regions[:, :, :, :-1]
+        target_dx = torch.abs(target[:, :, :, 1:] - target[:, :, :, :-1]) * non_edge_regions[:, :, :, :-1]
+        
+        source_dy = torch.abs(source[:, :, 1:, :] - source[:, :, :-1, :]) * non_edge_regions[:, :, :-1, :]
+        target_dy = torch.abs(target[:, :, 1:, :] - target[:, :, :-1, :]) * non_edge_regions[:, :, :-1, :]
+        
+        # Penalize when target has larger color transitions than source (indicates bleeding)
+        bleeding_loss_x = torch.mean(F.relu(target_dx - source_dx - 0.01))  # Small threshold for tolerance
+        bleeding_loss_y = torch.mean(F.relu(target_dy - source_dy - 0.01))
+        bleeding_loss = bleeding_loss_x + bleeding_loss_y
+        
+        return color_loss * 0.5 + bleeding_loss * 0.5
+
     def compute_G_loss(self):
         """Calculate GAN and NCE loss for the generator"""
         fake = self.fake_B
@@ -401,7 +547,20 @@ class CUTModel(BaseModel):
         else:
             self.loss_segmentation = 0.0
 
-        self.loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_eye + self.loss_skin + self.loss_segmentation
+        # Calculate edge preservation loss
+        if self.opt.lambda_edge > 0.0:
+            self.loss_edge = self.compute_edge_preservation_loss(self.real_A, self.fake_B) * self.opt.lambda_edge
+        else:
+            self.loss_edge = 0.0
+        
+        # Calculate color consistency loss
+        if self.opt.lambda_color_consistency > 0.0:
+            self.loss_color = self.compute_color_consistency_loss(self.real_A, self.fake_B) * self.opt.lambda_color_consistency
+        else:
+            self.loss_color = 0.0
+
+        self.loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_eye + self.loss_skin + \
+                     self.loss_segmentation + self.loss_edge + self.loss_color
         return self.loss_G
 
     def calculate_NCE_loss(self, src, tgt):

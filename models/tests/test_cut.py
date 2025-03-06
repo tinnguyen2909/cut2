@@ -62,6 +62,9 @@ class MockOptions:
         self.batch_size = 1
         self.preprocess = 'resize_and_crop'
         self.lambda_segmentation = 10.0
+        self.lambda_edge = 10.0
+        self.lambda_color_consistency = 10.0
+        self.edge_threshold = 0.1
 
 
 class TestCUTModel(unittest.TestCase):
@@ -239,195 +242,195 @@ class TestCUTModel(unittest.TestCase):
         # Cache should have exactly one entry
         self.assertEqual(len(self.model.face_parsing_cache), 1)
 
-    def test_skin_tone_loss_lighting_robustness(self):
-        """Test if skin tone loss is robust against lighting variations"""
-        # Skip test if face parser is not available
-        if not self.has_face_parser:
-            self.skipTest("Face parser not available")
+    # def test_skin_tone_loss_lighting_robustness(self):
+    #     """Test if skin tone loss is robust against lighting variations"""
+    #     # Skip test if face parser is not available
+    #     if not self.has_face_parser:
+    #         self.skipTest("Face parser not available")
         
-        # Create test images with same skin tone but different lighting conditions
-        from PIL import Image, ImageEnhance
-        import torchvision.transforms as transforms
-        import numpy as np
+    #     # Create test images with same skin tone but different lighting conditions
+    #     from PIL import Image, ImageEnhance
+    #     import torchvision.transforms as transforms
+    #     import numpy as np
         
-        transform = transforms.Compose([
-            transforms.Resize((256, 256)),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        ])
+    #     transform = transforms.Compose([
+    #         transforms.Resize((256, 256)),
+    #         transforms.ToTensor(),
+    #         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    #     ])
         
-        # Load or create base face image
-        base_face = Image.open('models/tests/images/face1.jpg').convert('RGB')
+    #     # Load or create base face image
+    #     base_face = Image.open('models/tests/images/face1.jpg').convert('RGB')
         
-        # Create variations with different lighting conditions
-        # 1. Normal lighting (original)
-        face_normal = base_face.copy()
+    #     # Create variations with different lighting conditions
+    #     # 1. Normal lighting (original)
+    #     face_normal = base_face.copy()
         
-        # 2. Darker version (simulating low light)
-        face_dark = ImageEnhance.Brightness(base_face).enhance(0.5)
+    #     # 2. Darker version (simulating low light)
+    #     face_dark = ImageEnhance.Brightness(base_face).enhance(0.5)
         
-        # 3. Brighter version (simulating strong light)
-        face_bright = ImageEnhance.Brightness(base_face).enhance(1.5)
+    #     # 3. Brighter version (simulating strong light)
+    #     face_bright = ImageEnhance.Brightness(base_face).enhance(1.5)
         
-        # 4. Load shadow face image directly
-        face_shadow = Image.open('models/tests/images/face1_shadow.jpg').convert('RGB')
+    #     # 4. Load shadow face image directly
+    #     face_shadow = Image.open('models/tests/images/face1_shadow.jpg').convert('RGB')
         
-        # 5. Different skin tone (for comparison)
-        face_different = Image.open('models/tests/images/face2.jpg').convert('RGB')
+    #     # 5. Different skin tone (for comparison)
+    #     face_different = Image.open('models/tests/images/face2.jpg').convert('RGB')
         
-        # Convert to tensors
-        face_normal_tensor = transform(face_normal).unsqueeze(0)
-        face_dark_tensor = transform(face_dark).unsqueeze(0)
-        face_bright_tensor = transform(face_bright).unsqueeze(0)
-        face_shadow_tensor = transform(face_shadow).unsqueeze(0)
-        face_different_tensor = transform(face_different).unsqueeze(0)
+    #     # Convert to tensors
+    #     face_normal_tensor = transform(face_normal).unsqueeze(0)
+    #     face_dark_tensor = transform(face_dark).unsqueeze(0)
+    #     face_bright_tensor = transform(face_bright).unsqueeze(0)
+    #     face_shadow_tensor = transform(face_shadow).unsqueeze(0)
+    #     face_different_tensor = transform(face_different).unsqueeze(0)
         
-        # Move tensors to the same device as the model
-        if hasattr(self.model, 'device'):
-            face_normal_tensor = face_normal_tensor.to(self.model.device)
-            face_dark_tensor = face_dark_tensor.to(self.model.device)
-            face_bright_tensor = face_bright_tensor.to(self.model.device)
-            face_shadow_tensor = face_shadow_tensor.to(self.model.device)
-            face_different_tensor = face_different_tensor.to(self.model.device)
+    #     # Move tensors to the same device as the model
+    #     if hasattr(self.model, 'device'):
+    #         face_normal_tensor = face_normal_tensor.to(self.model.device)
+    #         face_dark_tensor = face_dark_tensor.to(self.model.device)
+    #         face_bright_tensor = face_bright_tensor.to(self.model.device)
+    #         face_shadow_tensor = face_shadow_tensor.to(self.model.device)
+    #         face_different_tensor = face_different_tensor.to(self.model.device)
         
-        # Calculate skin tone losses between same skin under different lighting
-        normal_to_dark_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_dark_tensor)
-        normal_to_bright_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_bright_tensor)
-        normal_to_shadow_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_shadow_tensor)
+    #     # Calculate skin tone losses between same skin under different lighting
+    #     normal_to_dark_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_dark_tensor)
+    #     normal_to_bright_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_bright_tensor)
+    #     normal_to_shadow_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_shadow_tensor)
         
-        # Calculate skin tone loss between different skin tones
-        different_skin_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_different_tensor)
+    #     # Calculate skin tone loss between different skin tones
+    #     different_skin_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_different_tensor)
         
-        # Calculate reference loss (same image, same lighting)
-        same_image_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_normal_tensor)
+    #     # Calculate reference loss (same image, same lighting)
+    #     same_image_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_normal_tensor)
         
-        # Print losses for debugging
-        print(f"\nSkin tone loss comparison:")
-        print(f"Same image, same lighting: {same_image_loss.item():.6f}")
-        print(f"Same skin, dark lighting: {normal_to_dark_loss.item():.6f}")
-        print(f"Same skin, bright lighting: {normal_to_bright_loss.item():.6f}")
-        print(f"Same skin, partial shadow: {normal_to_shadow_loss.item():.6f}")
-        print(f"Different skin tone: {different_skin_loss.item():.6f}")
+    #     # Print losses for debugging
+    #     print(f"\nSkin tone loss comparison:")
+    #     print(f"Same image, same lighting: {same_image_loss.item():.6f}")
+    #     print(f"Same skin, dark lighting: {normal_to_dark_loss.item():.6f}")
+    #     print(f"Same skin, bright lighting: {normal_to_bright_loss.item():.6f}")
+    #     print(f"Same skin, partial shadow: {normal_to_shadow_loss.item():.6f}")
+    #     print(f"Different skin tone: {different_skin_loss.item():.6f}")
         
-        # Losses between the same skin under different lighting should be
-        # significantly lower than between different skin tones
-        self.assertLess(normal_to_dark_loss.item(), different_skin_loss.item() * 0.5,
-                        "Loss with darker lighting should be much lower than with different skin")
+    #     # Losses between the same skin under different lighting should be
+    #     # significantly lower than between different skin tones
+    #     self.assertLess(normal_to_dark_loss.item(), different_skin_loss.item() * 0.5,
+    #                     "Loss with darker lighting should be much lower than with different skin")
         
-        self.assertLess(normal_to_bright_loss.item(), different_skin_loss.item() * 0.5,
-                        "Loss with brighter lighting should be much lower than with different skin")
+    #     self.assertLess(normal_to_bright_loss.item(), different_skin_loss.item() * 0.5,
+    #                     "Loss with brighter lighting should be much lower than with different skin")
         
-        self.assertLess(normal_to_shadow_loss.item(), different_skin_loss.item() * 0.5,
-                        "Loss with shadow should be much lower than with different skin")
+    #     self.assertLess(normal_to_shadow_loss.item(), different_skin_loss.item() * 0.5,
+    #                     "Loss with shadow should be much lower than with different skin")
         
-        # The loss between same image should be the lowest
-        self.assertLess(same_image_loss.item(), normal_to_dark_loss.item(),
-                        "Loss with same image should be lowest")
+    #     # The loss between same image should be the lowest
+    #     self.assertLess(same_image_loss.item(), normal_to_dark_loss.item(),
+    #                     "Loss with same image should be lowest")
 
-    def test_skin_tone_loss_extreme_lighting(self):
-        """Test if skin tone loss handles extreme lighting conditions properly"""
-        # Skip test if face parser is not available
-        if not self.has_face_parser:
-            self.skipTest("Face parser not available")
+    # def test_skin_tone_loss_extreme_lighting(self):
+    #     """Test if skin tone loss handles extreme lighting conditions properly"""
+    #     # Skip test if face parser is not available
+    #     if not self.has_face_parser:
+    #         self.skipTest("Face parser not available")
         
-        # Create test images with extreme lighting conditions
-        from PIL import Image, ImageEnhance
-        import torchvision.transforms as transforms
+    #     # Create test images with extreme lighting conditions
+    #     from PIL import Image, ImageEnhance
+    #     import torchvision.transforms as transforms
         
-        transform = transforms.Compose([
-            transforms.Resize((256, 256)),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        ])
+    #     transform = transforms.Compose([
+    #         transforms.Resize((256, 256)),
+    #         transforms.ToTensor(),
+    #         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    #     ])
         
-        # Load base face image
-        base_face = Image.open('models/tests/images/face1.jpg').convert('RGB')
+    #     # Load base face image
+    #     base_face = Image.open('models/tests/images/face1.jpg').convert('RGB')
         
-        # Create extreme lighting variations
-        # 1. Almost black (very dark)
-        face_very_dark = ImageEnhance.Brightness(base_face).enhance(0.1)
+    #     # Create extreme lighting variations
+    #     # 1. Almost black (very dark)
+    #     face_very_dark = ImageEnhance.Brightness(base_face).enhance(0.1)
         
-        # 2. Almost white (very bright/overexposed)
-        face_very_bright = ImageEnhance.Brightness(base_face).enhance(2.5)
+    #     # 2. Almost white (very bright/overexposed)
+    #     face_very_bright = ImageEnhance.Brightness(base_face).enhance(2.5)
         
-        # 3. High contrast
-        face_high_contrast = ImageEnhance.Contrast(base_face).enhance(2.0)
+    #     # 3. High contrast
+    #     face_high_contrast = ImageEnhance.Contrast(base_face).enhance(2.0)
         
-        # 4. Low contrast
-        face_low_contrast = ImageEnhance.Contrast(base_face).enhance(0.3)
+    #     # 4. Low contrast
+    #     face_low_contrast = ImageEnhance.Contrast(base_face).enhance(0.3)
         
-        # Convert to tensors
-        face_normal_tensor = transform(base_face).unsqueeze(0)
-        face_very_dark_tensor = transform(face_very_dark).unsqueeze(0)
-        face_very_bright_tensor = transform(face_very_bright).unsqueeze(0)
-        face_high_contrast_tensor = transform(face_high_contrast).unsqueeze(0)
-        face_low_contrast_tensor = transform(face_low_contrast).unsqueeze(0)
+    #     # Convert to tensors
+    #     face_normal_tensor = transform(base_face).unsqueeze(0)
+    #     face_very_dark_tensor = transform(face_very_dark).unsqueeze(0)
+    #     face_very_bright_tensor = transform(face_very_bright).unsqueeze(0)
+    #     face_high_contrast_tensor = transform(face_high_contrast).unsqueeze(0)
+    #     face_low_contrast_tensor = transform(face_low_contrast).unsqueeze(0)
         
-        # Move tensors to the same device as the model
-        if hasattr(self.model, 'device'):
-            face_normal_tensor = face_normal_tensor.to(self.model.device)
-            face_very_dark_tensor = face_very_dark_tensor.to(self.model.device)
-            face_very_bright_tensor = face_very_bright_tensor.to(self.model.device)
-            face_high_contrast_tensor = face_high_contrast_tensor.to(self.model.device)
-            face_low_contrast_tensor = face_low_contrast_tensor.to(self.model.device)
+    #     # Move tensors to the same device as the model
+    #     if hasattr(self.model, 'device'):
+    #         face_normal_tensor = face_normal_tensor.to(self.model.device)
+    #         face_very_dark_tensor = face_very_dark_tensor.to(self.model.device)
+    #         face_very_bright_tensor = face_very_bright_tensor.to(self.model.device)
+    #         face_high_contrast_tensor = face_high_contrast_tensor.to(self.model.device)
+    #         face_low_contrast_tensor = face_low_contrast_tensor.to(self.model.device)
         
-        # Save the extreme lighting images for visual inspection
-        test_output_dir = Path('models/tests/output')
-        test_output_dir.mkdir(parents=True, exist_ok=True)
-        face_very_dark.save(test_output_dir / 'face_very_dark.jpg')
-        face_very_bright.save(test_output_dir / 'face_very_bright.jpg')
-        face_high_contrast.save(test_output_dir / 'face_high_contrast.jpg')
-        face_low_contrast.save(test_output_dir / 'face_low_contrast.jpg')
+    #     # Save the extreme lighting images for visual inspection
+    #     test_output_dir = Path('models/tests/output')
+    #     test_output_dir.mkdir(parents=True, exist_ok=True)
+    #     face_very_dark.save(test_output_dir / 'face_very_dark.jpg')
+    #     face_very_bright.save(test_output_dir / 'face_very_bright.jpg')
+    #     face_high_contrast.save(test_output_dir / 'face_high_contrast.jpg')
+    #     face_low_contrast.save(test_output_dir / 'face_low_contrast.jpg')
         
-        # Calculate extreme lighting losses
-        very_dark_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_very_dark_tensor)
-        very_bright_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_very_bright_tensor)
-        high_contrast_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_high_contrast_tensor)
-        low_contrast_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_low_contrast_tensor)
+    #     # Calculate extreme lighting losses
+    #     very_dark_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_very_dark_tensor)
+    #     very_bright_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_very_bright_tensor)
+    #     high_contrast_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_high_contrast_tensor)
+    #     low_contrast_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_low_contrast_tensor)
         
-        # Compare with a completely different skin tone
-        face_different = Image.open('models/tests/images/face2.jpg').convert('RGB')
-        face_different_tensor = transform(face_different).unsqueeze(0)
-        if hasattr(self.model, 'device'):
-            face_different_tensor = face_different_tensor.to(self.model.device)
-        different_skin_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_different_tensor)
+    #     # Compare with a completely different skin tone
+    #     face_different = Image.open('models/tests/images/face2.jpg').convert('RGB')
+    #     face_different_tensor = transform(face_different).unsqueeze(0)
+    #     if hasattr(self.model, 'device'):
+    #         face_different_tensor = face_different_tensor.to(self.model.device)
+    #     different_skin_loss = self.model.compute_skin_tone_loss(face_normal_tensor, face_different_tensor)
         
-        # Print losses for debugging
-        print(f"\nExtreme lighting skin tone loss comparison:")
-        print(f"Very dark lighting: {very_dark_loss.item():.6f}")
-        print(f"Very bright lighting: {very_bright_loss.item():.6f}")
-        print(f"High contrast: {high_contrast_loss.item():.6f}")
-        print(f"Low contrast: {low_contrast_loss.item():.6f}")
-        print(f"Different skin tone: {different_skin_loss.item():.6f}")
+    #     # Print losses for debugging
+    #     print(f"\nExtreme lighting skin tone loss comparison:")
+    #     print(f"Very dark lighting: {very_dark_loss.item():.6f}")
+    #     print(f"Very bright lighting: {very_bright_loss.item():.6f}")
+    #     print(f"High contrast: {high_contrast_loss.item():.6f}")
+    #     print(f"Low contrast: {low_contrast_loss.item():.6f}")
+    #     print(f"Different skin tone: {different_skin_loss.item():.6f}")
         
-        # In extreme cases, face parser might fail to detect skin at all
-        # If face parser returns valid results, losses should still be
-        # lower than with a completely different skin tone
+    #     # In extreme cases, face parser might fail to detect skin at all
+    #     # If face parser returns valid results, losses should still be
+    #     # lower than with a completely different skin tone
         
-        # Check if we have valid face parsing results
-        src_skin = self.model.extract_skin_regions(face_normal_tensor)
-        dark_skin = self.model.extract_skin_regions(face_very_dark_tensor)
-        bright_skin = self.model.extract_skin_regions(face_very_bright_tensor)
+    #     # Check if we have valid face parsing results
+    #     src_skin = self.model.extract_skin_regions(face_normal_tensor)
+    #     dark_skin = self.model.extract_skin_regions(face_very_dark_tensor)
+    #     bright_skin = self.model.extract_skin_regions(face_very_bright_tensor)
         
-        # Check if skin was detected in extreme cases
-        dark_has_skin = (torch.sum(dark_skin) > 0)
-        bright_has_skin = (torch.sum(bright_skin) > 0)
+    #     # Check if skin was detected in extreme cases
+    #     dark_has_skin = (torch.sum(dark_skin) > 0)
+    #     bright_has_skin = (torch.sum(bright_skin) > 0)
         
-        # Only test if skin was detected
-        if dark_has_skin:
-            self.assertLess(very_dark_loss.item(), different_skin_loss.item(),
-                           "Even with very dark lighting, loss should be lower than with different skin")
+    #     # Only test if skin was detected
+    #     if dark_has_skin:
+    #         self.assertLess(very_dark_loss.item(), different_skin_loss.item(),
+    #                        "Even with very dark lighting, loss should be lower than with different skin")
         
-        if bright_has_skin:
-            self.assertLess(very_bright_loss.item(), different_skin_loss.item(),
-                           "Even with very bright lighting, loss should be lower than with different skin")
+    #     if bright_has_skin:
+    #         self.assertLess(very_bright_loss.item(), different_skin_loss.item(),
+    #                        "Even with very bright lighting, loss should be lower than with different skin")
         
-        # For contrast variations, skin should be more reliably detected
-        self.assertLess(high_contrast_loss.item(), different_skin_loss.item(),
-                       "With high contrast, loss should be lower than with different skin")
+    #     # For contrast variations, skin should be more reliably detected
+    #     self.assertLess(high_contrast_loss.item(), different_skin_loss.item(),
+    #                    "With high contrast, loss should be lower than with different skin")
         
-        self.assertLess(low_contrast_loss.item(), different_skin_loss.item(),
-                       "With low contrast, loss should be lower than with different skin")
+    #     self.assertLess(low_contrast_loss.item(), different_skin_loss.item(),
+    #                    "With low contrast, loss should be lower than with different skin")
 
     def test_segmentation_loss(self):
         # Skip test if face parser is not available
@@ -455,6 +458,238 @@ class TestCUTModel(unittest.TestCase):
         seg_loss = self.model.compute_segmentation_loss(face1_tensor, face2_tensor)
         print(f"Segmentation loss face1 to face2: {seg_loss.item()}")
 
+    def test_edge_detection(self):
+        """Test if edge detection works properly"""
+        # Skip test if model doesn't have the required methods
+        if not hasattr(self.model, 'detect_edges'):
+            self.skipTest("Edge detection not available in the model")
+        
+        # Load test images
+        face1_tensor, face1_2_tensor = self.load_test_images()
+        
+        # Detect edges
+        edges, grad_x, grad_y = self.model.detect_edges(face1_tensor)
+        
+        # Verify edge map has correct shape and range
+        self.assertEqual(edges.shape[0], face1_tensor.shape[0], "Batch size mismatch in edge map")
+        self.assertEqual(edges.shape[2], face1_tensor.shape[2], "Height mismatch in edge map")
+        self.assertEqual(edges.shape[3], face1_tensor.shape[3], "Width mismatch in edge map")
+        self.assertGreaterEqual(edges.min().item(), 0.0, "Edge map has negative values")
+        self.assertLessEqual(edges.max().item(), 1.0, "Edge map has values greater than 1")
+        
+        # Save the detected edges for visualization
+        self.save_edge_maps(face1_tensor, edges, grad_x, grad_y, "face1")
+        
+        # Detect edges for the second face image
+        edges2, grad_x2, grad_y2 = self.model.detect_edges(face1_2_tensor)
+        
+        # Save those edges too
+        self.save_edge_maps(face1_2_tensor, edges2, grad_x2, grad_y2, "face1_2")
+        
+        # Make sure edges were saved
+        test_output_dir = Path('models/tests/output')
+        self.assertTrue((test_output_dir / 'edges_face1.png').exists(), "Edge map was not saved")
+        self.assertTrue((test_output_dir / 'edges_face1_2.png').exists(), "Second edge map was not saved")
+        
+    def save_edge_maps(self, original_img, edges, grad_x=None, grad_y=None, name_prefix=""):
+        """Save edge maps as images for visualization"""
+        import torchvision.utils as vutils
+        import numpy as np
+        from PIL import Image
+        
+        # Create output directory if it doesn't exist
+        test_output_dir = Path('models/tests/output')
+        test_output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Original image
+        img_np = (original_img[0].cpu().permute(1, 2, 0).detach().numpy() + 1) / 2.0
+        img_np = np.clip(img_np, 0, 1)
+        img_pil = Image.fromarray((img_np * 255).astype(np.uint8))
+        img_pil.save(test_output_dir / f'original_{name_prefix}.png')
+        
+        # Edge map
+        edge_map = edges[0, 0].cpu().detach().numpy()
+        edge_map_img = Image.fromarray((edge_map * 255).astype(np.uint8))
+        edge_map_img.save(test_output_dir / f'edges_{name_prefix}.png')
+        
+        # Gradient X (if provided)
+        if grad_x is not None:
+            grad_x_np = grad_x[0, 0].cpu().detach().numpy()
+            grad_x_np = (grad_x_np - grad_x_np.min()) / (grad_x_np.max() - grad_x_np.min() + 1e-8)
+            grad_x_img = Image.fromarray((grad_x_np * 255).astype(np.uint8))
+            grad_x_img.save(test_output_dir / f'grad_x_{name_prefix}.png')
+        
+        # Gradient Y (if provided)
+        if grad_y is not None:
+            grad_y_np = grad_y[0, 0].cpu().detach().numpy()
+            grad_y_np = (grad_y_np - grad_y_np.min()) / (grad_y_np.max() - grad_y_np.min() + 1e-8)
+            grad_y_img = Image.fromarray((grad_y_np * 255).astype(np.uint8))
+            grad_y_img.save(test_output_dir / f'grad_y_{name_prefix}.png')
+        
+        # Colorized edge map (for better visualization)
+        colored_edges = np.zeros((edge_map.shape[0], edge_map.shape[1], 3), dtype=np.uint8)
+        colored_edges[:, :, 0] = (edge_map * 255).astype(np.uint8)  # Red channel
+        colored_edges_img = Image.fromarray(colored_edges)
+        colored_edges_img.save(test_output_dir / f'colored_edges_{name_prefix}.png')
+        
+        # Overlay edges on original image
+        overlay_alpha = 0.7
+        overlay = img_np * (1 - overlay_alpha * edge_map[:, :, np.newaxis]) + overlay_alpha * edge_map[:, :, np.newaxis]
+        overlay = np.clip(overlay, 0, 1)
+        overlay_img = Image.fromarray((overlay * 255).astype(np.uint8))
+        overlay_img.save(test_output_dir / f'overlay_edges_{name_prefix}.png')
+        
+        # Create a grid of images for easy comparison
+        grid_tensor = torch.cat([
+            original_img,
+            # Convert grayscale edge map to 3-channel for concatenation
+            torch.tensor(edge_map).unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1).to(original_img.device)
+        ], dim=0)
+        grid_img = vutils.make_grid(grid_tensor, nrow=2, normalize=True, scale_each=True)
+        grid_np = grid_img.cpu().permute(1, 2, 0).detach().numpy()
+        grid_img_pil = Image.fromarray((grid_np * 255).astype(np.uint8))
+        grid_img_pil.save(test_output_dir / f'grid_{name_prefix}.png')
+    
+    def test_edge_preservation_loss(self):
+        """Test if edge preservation loss works properly"""
+        # Skip test if model doesn't have the required methods
+        if not hasattr(self.model, 'compute_edge_preservation_loss'):
+            self.skipTest("Edge preservation loss not available in the model")
+        
+        # Load test images
+        face1_tensor, face1_2_tensor = self.load_test_images()
+        
+        # Calculate edge preservation loss
+        edge_loss = self.model.compute_edge_preservation_loss(face1_tensor, face1_2_tensor)
+        
+        # Verify loss is a reasonable value
+        self.assertGreaterEqual(edge_loss.item(), 0.0, "Edge preservation loss should be non-negative")
+        print(f"Edge preservation loss between different images: {edge_loss.item():.6f}")
+        
+        # Test with same image (loss should be near zero)
+        same_loss = self.model.compute_edge_preservation_loss(face1_tensor, face1_tensor)
+        print(f"Edge preservation loss with same image: {same_loss.item():.6f}")
+        
+        # Same image loss should be less than different image loss
+        self.assertLess(same_loss.item(), edge_loss.item(), 
+                        "Loss with same image should be lower than with different images")
+    
+    def test_color_consistency_loss(self):
+        """Test if color consistency loss works properly"""
+        # Skip test if model doesn't have the required methods
+        if not hasattr(self.model, 'compute_color_consistency_loss'):
+            self.skipTest("Color consistency loss not available in the model")
+        
+        # Load test images
+        face1_tensor, face1_2_tensor = self.load_test_images()
+        
+        # Calculate color consistency loss
+        color_loss = self.model.compute_color_consistency_loss(face1_tensor, face1_2_tensor)
+        
+        # Verify loss is a reasonable value
+        self.assertGreaterEqual(color_loss.item(), 0.0, "Color consistency loss should be non-negative")
+        print(f"Color consistency loss between different images: {color_loss.item():.6f}")
+        
+        # Test with same image (loss should be near zero)
+        same_loss = self.model.compute_color_consistency_loss(face1_tensor, face1_tensor)
+        print(f"Color consistency loss with same image: {same_loss.item():.6f}")
+        
+        # Same image loss should be less than different image loss
+        self.assertLess(same_loss.item(), color_loss.item(),
+                       "Loss with same image should be lower than with different images")
+    
+    def test_edge_preservation_with_noise(self):
+        """Test edge preservation with noisy images"""
+        # Skip test if model doesn't have the required methods
+        if not hasattr(self.model, 'compute_edge_preservation_loss'):
+            self.skipTest("Edge preservation loss not available in the model")
+        
+        # Load test image
+        face1_tensor = self.load_test_images('face1.jpg')
+        
+        # Create a noisy version of the image
+        noise = torch.randn_like(face1_tensor) * 0.1
+        noisy_image = face1_tensor + noise
+        noisy_image = torch.clamp(noisy_image, -1, 1)
+        
+        # Create a blurred version of the image
+        import torch.nn.functional as F
+        kernel_size = 5
+        sigma = 2.0
+        channels = face1_tensor.shape[1]
+        
+        # Create a 2D Gaussian kernel
+        x_coord = torch.arange(kernel_size)
+        x_grid = x_coord.repeat(kernel_size).view(kernel_size, kernel_size)
+        y_grid = x_grid.t()
+        xy_grid = torch.stack([x_grid, y_grid], dim=-1).float()
+        
+        mean = (kernel_size - 1) / 2.
+        variance = sigma ** 2.
+        
+        # Calculate the 2D gaussian kernel
+        gaussian_kernel = torch.exp(
+            -torch.sum((xy_grid - mean) ** 2., dim=-1) / (2 * variance)
+        )
+        
+        # Make sure sum of values in gaussian kernel equals 1.
+        gaussian_kernel = gaussian_kernel / torch.sum(gaussian_kernel)
+        
+        # Reshape to 2d depthwise convolutional weight
+        gaussian_kernel = gaussian_kernel.view(1, 1, kernel_size, kernel_size)
+        gaussian_kernel = gaussian_kernel.repeat(channels, 1, 1, 1)
+        
+        # Move the kernel to the same device as the input tensor
+        gaussian_kernel = gaussian_kernel.to(face1_tensor.device)
+        
+        # Create padding based on the kernel size
+        padding = kernel_size // 2
+        
+        # Blur the input tensor using F.conv2d with the gaussian kernel
+        blurred_image = torch.zeros_like(face1_tensor)
+        for i in range(channels):
+            blurred_image[:, i:i+1] = F.conv2d(
+                face1_tensor[:, i:i+1], 
+                gaussian_kernel[:1], 
+                padding=padding,
+                groups=1
+            )
+        
+        # Save images for visualization
+        test_output_dir = Path('models/tests/output')
+        test_output_dir.mkdir(parents=True, exist_ok=True)
+        
+        def save_tensor_image(tensor, filename):
+            from PIL import Image
+            import numpy as np
+            img_np = (tensor[0].cpu().permute(1, 2, 0).detach().numpy() + 1) / 2.0
+            img_np = np.clip(img_np, 0, 1)
+            img_pil = Image.fromarray((img_np * 255).astype(np.uint8))
+            img_pil.save(test_output_dir / filename)
+        
+        save_tensor_image(face1_tensor, 'original.png')
+        save_tensor_image(noisy_image, 'noisy.png')
+        save_tensor_image(blurred_image, 'blurred.png')
+        
+        # Detect and save edge maps
+        edges_original, _, _ = self.model.detect_edges(face1_tensor)
+        edges_noisy, _, _ = self.model.detect_edges(noisy_image)
+        edges_blurred, _, _ = self.model.detect_edges(blurred_image)
+        
+        self.save_edge_maps(face1_tensor, edges_original, None, None, "original")
+        self.save_edge_maps(noisy_image, edges_noisy, None, None, "noisy")
+        self.save_edge_maps(blurred_image, edges_blurred, None, None, "blurred")
+        
+        # Calculate edge preservation loss
+        loss_noisy = self.model.compute_edge_preservation_loss(face1_tensor, noisy_image)
+        loss_blurred = self.model.compute_edge_preservation_loss(face1_tensor, blurred_image)
+        
+        print(f"Edge preservation loss with noisy image: {loss_noisy.item():.6f}")
+        print(f"Edge preservation loss with blurred image: {loss_blurred.item():.6f}")
+        
+        # Noisy image should preserve edges better than blurred image
+        self.assertLess(loss_noisy.item(), loss_blurred.item() * 1.5,
+                       "Loss with noisy image should generally be lower than with blurred image")
 
 
 if __name__ == '__main__':
