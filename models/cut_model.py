@@ -680,14 +680,14 @@ class CUTModel(BaseModel):
         return final_loss
 
     def compute_ethnicity_preservation_loss(self, source, target):
-        """Compute ethnicity preservation loss to keep the same race/ethnicity between source and target
+        """Compute ethnicity and age preservation loss to keep the same race/ethnicity and age between source and target
         
         Args:
             source (tensor): Source image tensor
             target (tensor): Target image tensor
             
         Returns:
-            tensor: Ethnicity preservation loss
+            tensor: Ethnicity and age preservation loss
         """
         import sys
         import os
@@ -706,25 +706,36 @@ class CUTModel(BaseModel):
             print("Error importing FairFace modules. Make sure the fairface directory is properly set up.")
             return torch.tensor(0.0, device=source.device)
         
-        # Lazy-load the race prediction model on first use
-        if not hasattr(self, 'race_model') or self.race_model is None:
+        # Lazy-load the race and age prediction models on first use
+        if not hasattr(self, 'fairface_model') or self.fairface_model is None:
             try:
                 # Import required components from FairFace
                 import torchvision.models as models
                 import torch.nn as nn
                 
-                # Initialize the race model
+                # Initialize the model for race, gender, and age prediction
                 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-                self.race_model = models.resnet34(pretrained=True)
-                self.race_model.fc = nn.Linear(self.race_model.fc.in_features, 18)
+                self.fairface_model = models.resnet34(pretrained=True)
+                self.fairface_model.fc = nn.Linear(self.fairface_model.fc.in_features, 18)
                 models_path = os.path.join(fairface_dir, 'models')
                 model_path = os.path.join(models_path, 'res34_fair_align_multi_4_20190809.pt')
-                self.race_model.load_state_dict(torch.load(model_path))
-                self.race_model = self.race_model.to(device)
-                self.race_model.eval()
-                print("FairFace race prediction model loaded successfully.")
+                
+                # Try to load the model, if it fails, use the race-only model
+                try:
+                    self.fairface_model.load_state_dict(torch.load(model_path))
+                    self.has_full_fairface = True
+                    print("FairFace full model (race, gender, age) loaded successfully.")
+                except:
+                    # Fallback to race-only model
+                    model_path = os.path.join(models_path, 'res34_fair_align_multi_4_20190809.pt')
+                    self.fairface_model.load_state_dict(torch.load(model_path))
+                    self.has_full_fairface = False
+                    print("FairFace race-only model loaded successfully.")
+                
+                self.fairface_model = self.fairface_model.to(device)
+                self.fairface_model.eval()
             except Exception as e:
-                print(f"Error loading race prediction model: {e}")
+                print(f"Error loading FairFace model: {e}")
                 return torch.tensor(0.0, device=source.device)
             
         # Define the image transformation
@@ -735,10 +746,11 @@ class CUTModel(BaseModel):
         
         # Process images in batches
         batch_size = source.size(0)
-        loss = 0.0
+        race_loss = 0.0
+        age_loss = 0.0
         
         # Set model to evaluation mode
-        self.race_model.eval()
+        self.fairface_model.eval()
         
         with torch.no_grad():
             for i in range(batch_size):
@@ -746,37 +758,77 @@ class CUTModel(BaseModel):
                 src_img = trans(source[i:i+1])  # Keep batch dimension
                 tgt_img = trans(target[i:i+1])  # Keep batch dimension
                 
-                # Get race predictions
-                src_outputs = self.race_model(src_img)
-                tgt_outputs = self.race_model(tgt_img)
+                # Get predictions
+                src_outputs = self.fairface_model(src_img)
+                tgt_outputs = self.fairface_model(tgt_img)
                 
                 # Extract race logits from outputs (first 4 classes are for race)
                 src_race_logits = src_outputs[:, :4]
                 tgt_race_logits = tgt_outputs[:, :4]
                 
-                # Get probabilities
+                # Get race probabilities
                 src_race_probs = F.softmax(src_race_logits, dim=1)
                 tgt_race_probs = F.softmax(tgt_race_logits, dim=1)
                 
-                # Calculate KL divergence loss between distributions
-                kl_loss = F.kl_div(
+                # Calculate race preservation loss
+                race_kl_loss = F.kl_div(
                     F.log_softmax(tgt_race_logits, dim=1),
                     src_race_probs,
                     reduction='batchmean'
                 )
+                race_l1_loss = F.l1_loss(tgt_race_probs, src_race_probs)
+                img_race_loss = 0.5 * race_kl_loss + 0.5 * race_l1_loss
+                race_loss += img_race_loss
                 
-                # Calculate L1 loss between probability distributions
-                l1_loss = F.l1_loss(tgt_race_probs, src_race_probs)
+                # If we have the full FairFace model with age prediction
+                if self.has_full_fairface:
+                    # Extract age logits (indices 9-18 are for age)
+                    src_age_logits = src_outputs[:, 9:18]
+                    tgt_age_logits = tgt_outputs[:, 9:18]
+                    
+                    # Get age probabilities
+                    src_age_probs = F.softmax(src_age_logits, dim=1)
+                    tgt_age_probs = F.softmax(tgt_age_logits, dim=1)
+                    
+                    # Calculate age preservation loss
+                    age_kl_loss = F.kl_div(
+                        F.log_softmax(tgt_age_logits, dim=1),
+                        src_age_probs,
+                        reduction='batchmean'
+                    )
+                    age_l1_loss = F.l1_loss(tgt_age_probs, src_age_probs)
+                    
+                    # Calculate expected age difference
+                    # Age categories: 0-2, 3-9, 10-19, 20-29, 30-39, 40-49, 50-59, 60-69, 70+
+                    age_midpoints = torch.tensor([1.0, 6.0, 15.0, 25.0, 35.0, 45.0, 55.0, 65.0, 75.0], 
+                                                device=src_age_probs.device)
+                    
+                    # Calculate expected age for source and target
+                    src_expected_age = torch.sum(src_age_probs * age_midpoints, dim=1)
+                    tgt_expected_age = torch.sum(tgt_age_probs * age_midpoints, dim=1)
+                    
+                    # Add expected age difference loss (normalized by typical age range)
+                    age_diff_loss = F.l1_loss(src_expected_age, tgt_expected_age) / 75.0
+                    
+                    # Combine age losses
+                    img_age_loss = 0.4 * age_kl_loss + 0.4 * age_l1_loss + 0.2 * age_diff_loss
+                    age_loss += img_age_loss
                 
-                # Combine losses
-                img_loss = 0.5 * kl_loss + 0.5 * l1_loss
-                loss += img_loss
-                
-        # Average loss over batch
+        # Average losses over batch
         if batch_size > 0:
-            loss = loss / batch_size
+            race_loss = race_loss / batch_size
+            if self.has_full_fairface:
+                age_loss = age_loss / batch_size
+                
+        # Combine race and age losses
+        if self.has_full_fairface:
+            # Weight race and age losses (0.6 for race, 0.4 for age)
+            final_loss = 0.6 * race_loss + 0.4 * age_loss
+        else:
+            # If we don't have age prediction, just use race loss
+            final_loss = race_loss
             
-        return loss
+        return final_loss
 
     def extract_lip_regions(self, img):
         """Extract lip regions from an image using face parsing"""
@@ -794,9 +846,13 @@ class CUTModel(BaseModel):
         else:
             # Fallback to simple heuristic if face parser not available
             b, c, h, w = img.size()
-            mouth_region = img[:, :, h//2:3*h//4, w//3:2*w//3]
-            mask = torch.ones((b, 1, h, w), device=img.device)
+            # Create a mask with the same dimensions as the original image
+            mask = torch.zeros((b, 1, h, w), device=img.device)
             mask[:, :, h//2:3*h//4, w//3:2*w//3] = 1
+            
+            # Apply mask to get mouth region
+            mouth_region = img * mask
+            
             return mouth_region, mask
 
     def extract_teeth_regions(self, img):
@@ -815,9 +871,13 @@ class CUTModel(BaseModel):
         else:
             # Simple fallback
             b, c, h, w = img.size()
-            teeth_region = img[:, :, h//2:3*h//4, w//3+w//12:2*w//3-w//12]
-            mask = torch.ones((b, 1, h, w), device=img.device)
+            # Create a mask with the same dimensions as the original image
+            mask = torch.zeros((b, 1, h, w), device=img.device)
             mask[:, :, h//2:3*h//4, w//3+w//12:2*w//3-w//12] = 1
+            
+            # Apply mask to get teeth region
+            teeth_region = img * mask
+            
             return teeth_region, mask
 
     def compute_lips_preservation_loss(self, src, tgt):
