@@ -68,8 +68,27 @@ class UnalignedDataset(BaseDataset):
         else:   # randomize the index for domain B to avoid fixed pairs.
             index_B = random.randint(0, self.B_size - 1)
         B_path = self.B_paths[index_B]
-        A_img = Image.open(A_path).convert('RGB')
-        B_img = Image.open(B_path).convert('RGB')
+        A_img = Image.open(A_path)
+        B_img = Image.open(B_path)
+        
+        # Handle alpha channel by compositing against white background
+        if A_img.mode in ('RGBA', 'LA') or (A_img.mode == 'P' and 'transparency' in A_img.info):
+            # Create a white background image
+            white_bg = Image.new('RGBA', A_img.size, (255, 255, 255, 255))
+            # Paste the image on the background
+            white_bg.paste(A_img, (0, 0), A_img)
+            A_img = white_bg
+            
+        if B_img.mode in ('RGBA', 'LA') or (B_img.mode == 'P' and 'transparency' in B_img.info):
+            # Create a white background image
+            white_bg = Image.new('RGBA', B_img.size, (255, 255, 255, 255))
+            # Paste the image on the background
+            white_bg.paste(B_img, (0, 0), B_img)
+            B_img = white_bg
+            
+        # Convert to RGB
+        A_img = A_img.convert('RGB')
+        B_img = B_img.convert('RGB')
 
         # Apply image transformation
         # For CUT/FastCUT mode, if in finetuning phase (learning rate is decaying),

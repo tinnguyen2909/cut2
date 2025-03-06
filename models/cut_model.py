@@ -51,6 +51,10 @@ class CUTModel(BaseModel):
         # Add option for ethnicity preservation
         parser.add_argument('--lambda_ethnicity', type=float, default=2.0, help='weight for ethnicity preservation loss')
 
+        # Add options for lips and teeth preservation
+        parser.add_argument('--lambda_lips', type=float, default=2.0, help='weight for lips shape and color preservation loss')
+        parser.add_argument('--lambda_teeth', type=float, default=2.0, help='weight for teeth preservation loss')
+
         parser.set_defaults(pool_size=0)  # no image pooling
 
         opt, _ = parser.parse_known_args()
@@ -94,6 +98,11 @@ class CUTModel(BaseModel):
         # Add ethnicity preservation loss
         if opt.lambda_ethnicity > 0.0:
             self.loss_names.append('ethnicity')
+        # Add lips and teeth preservation losses
+        if opt.lambda_lips > 0.0:
+            self.loss_names.append('lips')
+        if opt.lambda_teeth > 0.0:
+            self.loss_names.append('teeth')
 
         if opt.nce_idt and self.isTrain:
             self.loss_names += ['NCE_Y']
@@ -574,9 +583,22 @@ class CUTModel(BaseModel):
             self.loss_ethnicity = self.compute_ethnicity_preservation_loss(self.real_A, self.fake_B) * self.opt.lambda_ethnicity
         else:
             self.loss_ethnicity = 0.0
+            
+        # Calculate lips preservation loss
+        if self.opt.lambda_lips > 0.0:
+            self.loss_lips = self.compute_lips_preservation_loss(self.real_A, self.fake_B) * self.opt.lambda_lips
+        else:
+            self.loss_lips = 0.0
+            
+        # Calculate teeth preservation loss
+        if self.opt.lambda_teeth > 0.0:
+            self.loss_teeth = self.compute_teeth_preservation_loss(self.real_A, self.fake_B) * self.opt.lambda_teeth
+        else:
+            self.loss_teeth = 0.0
 
         self.loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_eye + self.loss_skin + \
-                     self.loss_segmentation + self.loss_edge + self.loss_color + self.loss_ethnicity
+                     self.loss_segmentation + self.loss_edge + self.loss_color + self.loss_ethnicity + \
+                     self.loss_lips + self.loss_teeth
         return self.loss_G
 
     def calculate_NCE_loss(self, src, tgt):
@@ -755,3 +777,113 @@ class CUTModel(BaseModel):
             loss = loss / batch_size
             
         return loss
+
+    def extract_lip_regions(self, img):
+        """Extract lip regions from an image using face parsing"""
+        if self.has_face_parser:
+            # Get face parsing masks
+            masks = self.get_face_parsing_masks(img)
+            
+            # Create lip mask (upper and lower lips)
+            lip_mask = ((masks == 11) | (masks == 12)).float().unsqueeze(1)  # 11: u_lip, 12: l_lip
+            
+            # Apply mask to get lip regions
+            lip_regions = img * lip_mask
+            
+            return lip_regions, lip_mask
+        else:
+            # Fallback to simple heuristic if face parser not available
+            b, c, h, w = img.size()
+            mouth_region = img[:, :, h//2:3*h//4, w//3:2*w//3]
+            mask = torch.ones((b, 1, h, w), device=img.device)
+            mask[:, :, h//2:3*h//4, w//3:2*w//3] = 1
+            return mouth_region, mask
+
+    def extract_teeth_regions(self, img):
+        """Extract teeth/inner mouth regions using face parsing"""
+        if self.has_face_parser:
+            # Get face parsing masks
+            masks = self.get_face_parsing_masks(img)
+            
+            # Create mouth mask
+            mouth_mask = (masks == 10).float().unsqueeze(1)  # 10: mouth
+            
+            # Apply mask to get inner mouth/teeth regions
+            teeth_regions = img * mouth_mask
+            
+            return teeth_regions, mouth_mask
+        else:
+            # Simple fallback
+            b, c, h, w = img.size()
+            teeth_region = img[:, :, h//2:3*h//4, w//3+w//12:2*w//3-w//12]
+            mask = torch.ones((b, 1, h, w), device=img.device)
+            mask[:, :, h//2:3*h//4, w//3+w//12:2*w//3-w//12] = 1
+            return teeth_region, mask
+
+    def compute_lips_preservation_loss(self, src, tgt):
+        """Calculate loss for preserving lip shape and color"""
+        src_lips, src_mask = self.extract_lip_regions(src)
+        tgt_lips, tgt_mask = self.extract_lip_regions(tgt)
+        
+        # Create combined mask - only consider pixels where both source and target detected lips
+        combined_mask = src_mask * tgt_mask
+        
+        # If no lip pixels are detected, return zero loss
+        if combined_mask.sum() < 1.0:
+            return torch.tensor(0.0, device=self.device)
+        
+        # Apply mask
+        src_lips_masked = src_lips * combined_mask
+        tgt_lips_masked = tgt_lips * combined_mask
+        
+        # Calculate color statistics
+        src_mean = torch.sum(src_lips_masked, dim=[2, 3]) / (combined_mask.sum() + 1e-6)
+        tgt_mean = torch.sum(tgt_lips_masked, dim=[2, 3]) / (combined_mask.sum() + 1e-6)
+        
+        # Calculate shape and color preservation losses
+        color_loss = F.l1_loss(src_mean, tgt_mean)
+        
+        # For shape preservation, we use both texture and edge losses
+        texture_loss = F.l1_loss(src_lips_masked, tgt_lips_masked)
+        
+        # Detect edges in the lip regions for shape analysis
+        src_lips_edges, _, _ = self.detect_edges(src_lips_masked)
+        tgt_lips_edges, _, _ = self.detect_edges(tgt_lips_masked)
+        edge_loss = F.l1_loss(src_lips_edges, tgt_lips_edges)
+        
+        # Combine losses with appropriate weights
+        return color_loss * 0.3 + texture_loss * 0.4 + edge_loss * 0.3
+
+    def compute_teeth_preservation_loss(self, src, tgt):
+        """Calculate loss for preserving teeth appearance"""
+        src_teeth, src_mask = self.extract_teeth_regions(src)
+        tgt_teeth, tgt_mask = self.extract_teeth_regions(tgt)
+        
+        # Create combined mask
+        combined_mask = src_mask * tgt_mask
+        
+        # If no teeth/mouth pixels are detected, return zero loss
+        if combined_mask.sum() < 1.0:
+            return torch.tensor(0.0, device=self.device)
+        
+        # Apply mask
+        src_teeth_masked = src_teeth * combined_mask
+        tgt_teeth_masked = tgt_teeth * combined_mask
+        
+        # For teeth, brightness and whiteness are important
+        # Calculate brightness
+        src_brightness = torch.mean(src_teeth_masked, dim=1, keepdim=True)
+        tgt_brightness = torch.mean(tgt_teeth_masked, dim=1, keepdim=True)
+        
+        # Calculate whiteness (how close to white)
+        # White has equal RGB values close to 1, so we penalize deviation from this pattern
+        src_whiteness = torch.std(src_teeth_masked, dim=1, keepdim=True)  # Lower std means more equal RGB values
+        tgt_whiteness = torch.std(tgt_teeth_masked, dim=1, keepdim=True)
+        
+        # Calculate teeth preservation losses
+        brightness_loss = F.l1_loss(src_brightness, tgt_brightness)
+        whiteness_loss = F.l1_loss(src_whiteness, tgt_whiteness)
+        texture_loss = F.l1_loss(src_teeth_masked, tgt_teeth_masked)
+        
+        # Combine losses
+        return brightness_loss * 0.3 + whiteness_loss * 0.3 + texture_loss * 0.4
