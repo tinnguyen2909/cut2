@@ -37,6 +37,9 @@ class UnalignedDataset(BaseDataset):
                 self.A_paths.extend(paths)
                 if len(self.A_paths) >= opt.max_dataset_size:
                     break
+        if not self.opt.serial_batches:
+            # Shuffle the A_paths list
+            random.shuffle(self.A_paths)
         
         # Load images from all directories for domain B
         self.B_paths = []

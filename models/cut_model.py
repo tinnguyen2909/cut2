@@ -5,6 +5,7 @@ from . import networks
 from .patchnce import PatchNCELoss
 import util.util as util
 import torch.nn.functional as F
+import os
 
 
 class CUTModel(BaseModel):
@@ -58,7 +59,23 @@ class CUTModel(BaseModel):
         # Add option for background preservation
         parser.add_argument('--lambda_background', type=float, default=2.0, help='weight for background content and color preservation loss')
 
+        # Face preservation parameters
+        parser.add_argument('--face_preservation', type=util.str2bool, default=False, 
+                           help='preserve face features during stage 2 training')
+        parser.add_argument('--lambda_face_preservation', type=float, default=10.0,
+                           help='weight for face preservation loss')
+        parser.add_argument('--stage1_checkpoint', type=str, default='',
+                           help='path to stage 1 model checkpoint for face preservation')
+        
         parser.set_defaults(pool_size=0)  # no image pooling
+
+        # Add new options for face mask
+        parser.add_argument('--include_ears_in_face', type=util.str2bool, default=False, 
+                           help='include ears in face mask for preservation')
+        parser.add_argument('--include_neck_in_face', type=util.str2bool, default=False, 
+                           help='include neck in face mask for preservation')
+        parser.add_argument('--face_mask_dilation', type=int, default=5, 
+                           help='dilation of face mask in pixels to create smooth transitions')
 
         opt, _ = parser.parse_known_args()
 
@@ -83,6 +100,10 @@ class CUTModel(BaseModel):
         self.loss_names = ['G_GAN', 'D_real', 'D_fake', 'G', 'NCE']
         self.visual_names = ['real_A', 'fake_B', 'real_B']
         self.nce_layers = [int(i) for i in self.opt.nce_layers.split(',')]
+
+        # Add face mask visualization if face preservation is enabled
+        if opt.face_preservation and opt.lambda_face_preservation > 0.0:
+            self.visual_names.append('face_mask_vis')
 
         # Add new losses for eye color and skin tone preservation
         if opt.lambda_eye > 0.0:
@@ -147,7 +168,8 @@ class CUTModel(BaseModel):
                 opt.lambda_background > 0.0 or
                 opt.lambda_lips > 0.0 or
                 opt.lambda_teeth > 0.0 or
-                opt.lambda_segmentation > 0.0
+                opt.lambda_segmentation > 0.0 or
+                (opt.lambda_face_preservation > 0.0 and opt.face_preservation)
             ) and opt.use_face_parser:
                 try:
                     from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
@@ -178,6 +200,27 @@ class CUTModel(BaseModel):
             # Initialize race prediction model
             self.race_model = None
             self.race_model_loaded = False
+
+        # Add face preservation loss
+        if opt.face_preservation and opt.lambda_face_preservation > 0.0:
+            self.loss_names.append('face_preservation')
+            
+            # Load stage 1 model if checkpoint provided
+            if opt.stage1_checkpoint and os.path.exists(opt.stage1_checkpoint):
+                self.face_model_stage1 = networks.define_G(opt.input_nc, opt.output_nc, 
+                                                          opt.ngf, opt.netG, opt.normG, 
+                                                          not opt.no_dropout, opt.init_type, 
+                                                          opt.init_gain, opt.no_antialias, 
+                                                          opt.no_antialias_up, self.gpu_ids, opt)
+                state_dict = torch.load(opt.stage1_checkpoint)
+                self.face_model_stage1.load_state_dict(state_dict)
+                self.face_model_stage1.eval()
+                print('Loaded stage 1 face model from', opt.stage1_checkpoint)
+            else:
+                print('WARNING: face_preservation enabled but no stage1_checkpoint provided')
+
+            # Create visualization of face mask for the first image in batch
+            self.face_mask_vis = None
 
     def data_dependent_initialize(self, data):
         """
@@ -398,6 +441,12 @@ class CUTModel(BaseModel):
         self.fake_B = self.fake[:self.real_A.size(0)]
         if self.opt.nce_idt:
             self.idt_B = self.fake[self.real_A.size(0):]
+            
+        # Create face mask visualization if face preservation is enabled
+        if self.opt.face_preservation and self.opt.lambda_face_preservation > 0.0:
+            face_masks = self.get_face_masks(self.real_A)
+            # Create colorized visualization of the face mask
+            self.face_mask_vis = self.colorize_mask(face_masks, self.real_A)
 
     def compute_D_loss(self):
         """Calculate GAN loss for the discriminator"""
@@ -616,10 +665,67 @@ class CUTModel(BaseModel):
         else:
             self.loss_background = 0.0
 
-        self.loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_eye + self.loss_skin + \
+        # Add face preservation loss during stage 2 training
+        if self.opt.face_preservation and hasattr(self, 'face_model_stage1'):
+            # Extract face regions by combining facial component masks
+            # We can use a combined mask from existing facial component extractions
+            face_masks = self.get_face_masks(self.real_A)
+            
+            # Calculate the ratio of face area to total image area
+            face_area_ratio = face_masks.mean([1, 2, 3])  # Average over C, H, W dimensions to get ratio per batch item
+            
+            # Initialize face preservation loss
+            self.loss_face_preservation = torch.tensor(0.0, device=self.device)
+            
+            # Check if batch contains images with faces larger than threshold (20%)
+            face_threshold = 0.20  # 20% threshold
+            has_significant_face = face_area_ratio > face_threshold
+            
+            if has_significant_face.any():
+                # Apply face mask to get face regions (only for images with significant faces)
+                real_A_face = self.real_A * face_masks
+                fake_B_face = self.fake_B * face_masks
+                
+                # Get face translation from stage 1 model
+                with torch.no_grad():
+                    # Forward pass with the stage 1 model
+                    stage1_fake_B = self.face_model_stage1(self.real_A)
+                    # Apply face mask to focus only on face regions
+                    stage1_fake_B_face = stage1_fake_B * face_masks
+                
+                # Force current model to match stage 1 output for faces using L1 loss
+                # Only compute loss for images with significant faces
+                if has_significant_face.all():
+                    # All images have significant faces, compute loss on full batch
+                    self.loss_face_preservation = F.l1_loss(fake_B_face, stage1_fake_B_face) * self.opt.lambda_face_preservation
+                else:
+                    # Some images have significant faces, compute loss only on those
+                    # Get indices of images with significant faces
+                    indices = torch.where(has_significant_face)[0]
+                    
+                    # Select only the images with significant faces
+                    sel_fake_B_face = fake_B_face[indices]
+                    sel_stage1_fake_B_face = stage1_fake_B_face[indices]
+                    
+                    # Compute loss only on selected images
+                    self.loss_face_preservation = F.l1_loss(sel_fake_B_face, sel_stage1_fake_B_face) * self.opt.lambda_face_preservation
+                
+                # Log the face area ratio for monitoring
+                self.face_area_ratio = face_area_ratio.mean().item()
+            else:
+                # No significant faces in batch, set face area ratio for logging
+                self.face_area_ratio = face_area_ratio.mean().item()
+                
+            # Add to total loss
+            loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_eye + self.loss_skin + \
+                     self.loss_segmentation + self.loss_edge + self.loss_color + self.loss_ethnicity + \
+                     self.loss_lips + self.loss_teeth + self.loss_background + self.loss_face_preservation
+        else:
+            loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_eye + self.loss_skin + \
                      self.loss_segmentation + self.loss_edge + self.loss_color + self.loss_ethnicity + \
                      self.loss_lips + self.loss_teeth + self.loss_background
-        return self.loss_G
+
+        return loss_G
 
     def calculate_NCE_loss(self, src, tgt):
         n_layers = len(self.nce_layers)
@@ -918,7 +1024,6 @@ class CUTModel(BaseModel):
         
         # Calculate color statistics
         src_mean = torch.sum(src_lips_masked, dim=[2, 3]) / (combined_mask.sum() + 1e-6)
-        tgt_mean = torch.sum(tgt_lips_masked, dim=[2, 3]) / (combined_mask.sum() + 1e-6)
         
         # Calculate shape and color preservation losses
         color_loss = F.l1_loss(src_mean, tgt_mean)
@@ -1061,3 +1166,139 @@ class CUTModel(BaseModel):
         
         # Return mean SSIM
         return ssim_map.mean()
+
+    def get_face_masks(self, img):
+        """Create binary masks separating face from non-face regions using face parsing model"""
+        batch_size = img.size(0)
+        h, w = img.size(2), img.size(3)
+        
+        # Initialize empty mask
+        face_mask = torch.zeros((batch_size, 1, h, w), device=img.device)
+        
+        # If we have face parsing capability, use it directly
+        if hasattr(self, 'has_face_parser') and self.has_face_parser:
+            parsing_masks = self.get_face_parsing_masks(img)
+            
+            # Based on the face parser configuration, define facial features
+            # Map of semantic labels from config.json
+            face_feature_labels = [
+                1,   # skin
+                2,   # nose
+                3,   # eye_g (glasses)
+                4,   # l_eye
+                5,   # r_eye
+                6,   # l_brow
+                7,   # r_brow
+                10,  # mouth
+                11,  # u_lip
+                12,  # l_lip
+            ]
+            
+            # Optional: include ears, neck in face mask
+            if hasattr(self.opt, 'include_ears_in_face') and self.opt.include_ears_in_face:
+                face_feature_labels.extend([8, 9])  # left ear, right ear
+            
+            if hasattr(self.opt, 'include_neck_in_face') and self.opt.include_neck_in_face:
+                face_feature_labels.extend([16, 17])  # neck_l, neck
+            
+            # Create facial features mask
+            facial_features_mask = torch.zeros_like(parsing_masks, dtype=torch.bool)
+            for label in face_feature_labels:
+                facial_features_mask = torch.logical_or(facial_features_mask, parsing_masks == label)
+            
+            # Convert to float and add channel dimension
+            face_mask = facial_features_mask.float().unsqueeze(1)
+        else:
+            # Fallback to component-based approach if face parser not available
+            # Add eye regions to mask
+            if hasattr(self, 'extract_eye_regions'):
+                _, eye_mask = self.extract_eye_regions(img)
+                face_mask = torch.max(face_mask, eye_mask)
+            
+            # Add skin regions to mask
+            if hasattr(self, 'extract_skin_regions'):
+                _, skin_mask = self.extract_skin_regions(img)
+                face_mask = torch.max(face_mask, skin_mask)
+            
+            # Add lip regions to mask
+            if hasattr(self, 'extract_lip_regions'):
+                _, lip_mask = self.extract_lip_regions(img)
+                face_mask = torch.max(face_mask, lip_mask)
+            
+            # Add teeth regions to mask
+            if hasattr(self, 'extract_teeth_regions'):
+                _, teeth_mask = self.extract_teeth_regions(img)
+                face_mask = torch.max(face_mask, teeth_mask)
+        
+        # Optionally dilate the mask to include a small border around the face
+        if hasattr(self.opt, 'face_mask_dilation') and self.opt.face_mask_dilation > 0:
+            kernel_size = self.opt.face_mask_dilation * 2 + 1
+            padding = self.opt.face_mask_dilation
+            face_mask = F.max_pool2d(face_mask, kernel_size=kernel_size, 
+                                   stride=1, padding=padding)
+        
+        return face_mask
+
+    def colorize_mask(self, mask, original_img):
+        """Create a color visualization of the face mask overlaid on the original image
+        
+        Args:
+            mask: Binary mask tensor [B, 1, H, W]
+            original_img: Original image tensor [B, C, H, W]
+            
+        Returns:
+            Visualization tensor [B, 3, H, W]
+        """
+        # Use a distinguishable color for the face mask overlay (light green)
+        batch_size, _, h, w = mask.size()
+        
+        # Create an RGB highlight for the mask
+        highlight_color = torch.tensor([0.0, 1.0, 0.3], device=mask.device).view(1, 3, 1, 1)
+        mask_rgb = highlight_color.expand(batch_size, 3, h, w) * mask.expand(-1, 3, -1, -1)
+        
+        # Create a semi-transparent overlay
+        alpha = 0.5
+        overlay = original_img * (1.0 - alpha * mask.expand(-1, 3, -1, -1)) + mask_rgb * alpha
+        
+        # Add a border around the mask
+        kernel_size = 3
+        padding = kernel_size // 2
+        dilated_mask = F.max_pool2d(mask, kernel_size=kernel_size, stride=1, padding=padding)
+        edge_mask = (dilated_mask - mask).expand(-1, 3, -1, -1)
+        
+        # Add bright border around the mask (yellow)
+        border_color = torch.tensor([1.0, 1.0, 0.0], device=mask.device).view(1, 3, 1, 1)
+        border_rgb = border_color.expand(batch_size, 3, h, w) * edge_mask
+        
+        # Add border to the overlay
+        overlay = overlay + border_rgb
+        
+        # Calculate face area percentage for each image in batch
+        face_area_ratio = mask.mean([1, 2, 3]) * 100  # Convert to percentage
+        
+        # Add text overlay with face area percentage
+        # We'll create this by drawing directly on the first few rows of the image
+        for i in range(batch_size):
+            # Format text: "Face: XX.X%" with threshold indicator
+            ratio_value = face_area_ratio[i].item()
+            threshold_indicator = "✓" if ratio_value >= 20.0 else "✗"
+            
+            # Set text color based on threshold (white or yellow)
+            text_color = torch.tensor([1.0, 1.0, 1.0], device=mask.device) if ratio_value >= 20.0 else torch.tensor([1.0, 1.0, 0.0], device=mask.device)
+            
+            # Create text background (dark rectangle at top)
+            overlay[i, :, :20, :200] = torch.tensor([0.0, 0.0, 0.0], device=mask.device).view(3, 1, 1)
+            
+            # Draw simple text representation using rectangles (limited by tensor operations)
+            # Display "Face: XX.X% [✓/✗]"
+            # We'll make a simple colored indicator in the top-left corner
+            indicator_color = torch.tensor([0.0, 1.0, 0.0], device=mask.device) if ratio_value >= 20.0 else torch.tensor([1.0, 0.0, 0.0], device=mask.device)
+            
+            # Draw colored indicator box
+            overlay[i, :, 5:15, 5:15] = indicator_color.view(3, 1, 1)
+            
+            # Draw percentage text (simple colored box to represent text)
+            # This is a basic approach since we can't easily render text in tensors
+            overlay[i, :, 5:15, 20:100] = text_color.view(3, 1, 1) * 0.8
+        
+        return overlay
