@@ -55,6 +55,9 @@ class CUTModel(BaseModel):
         parser.add_argument('--lambda_lips', type=float, default=2.0, help='weight for lips shape and color preservation loss')
         parser.add_argument('--lambda_teeth', type=float, default=2.0, help='weight for teeth preservation loss')
 
+        # Add option for background preservation
+        parser.add_argument('--lambda_background', type=float, default=2.0, help='weight for background content and color preservation loss')
+
         parser.set_defaults(pool_size=0)  # no image pooling
 
         opt, _ = parser.parse_known_args()
@@ -103,6 +106,10 @@ class CUTModel(BaseModel):
             self.loss_names.append('lips')
         if opt.lambda_teeth > 0.0:
             self.loss_names.append('teeth')
+        
+        # Add background preservation loss
+        if opt.lambda_background > 0.0:
+            self.loss_names.append('background')
 
         if opt.nce_idt and self.isTrain:
             self.loss_names += ['NCE_Y']
@@ -134,7 +141,14 @@ class CUTModel(BaseModel):
             self.optimizers.append(self.optimizer_D)
             
             # Initialize face parser if needed
-            if (opt.lambda_eye > 0.0 or opt.lambda_skin > 0.0) and opt.use_face_parser:
+            if (
+                opt.lambda_eye > 0.0 or 
+                opt.lambda_skin > 0.0 or
+                opt.lambda_background > 0.0 or
+                opt.lambda_lips > 0.0 or
+                opt.lambda_teeth > 0.0 or
+                opt.lambda_segmentation > 0.0
+            ) and opt.use_face_parser:
                 try:
                     from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
                     self.has_face_parser = True
@@ -596,9 +610,15 @@ class CUTModel(BaseModel):
         else:
             self.loss_teeth = 0.0
 
+        # Calculate background preservation loss
+        if self.opt.lambda_background > 0.0:
+            self.loss_background = self.compute_background_preservation_loss(self.real_A, self.fake_B) * self.opt.lambda_background
+        else:
+            self.loss_background = 0.0
+
         self.loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_eye + self.loss_skin + \
                      self.loss_segmentation + self.loss_edge + self.loss_color + self.loss_ethnicity + \
-                     self.loss_lips + self.loss_teeth
+                     self.loss_lips + self.loss_teeth + self.loss_background
         return self.loss_G
 
     def calculate_NCE_loss(self, src, tgt):
@@ -947,3 +967,97 @@ class CUTModel(BaseModel):
         
         # Combine losses
         return brightness_loss * 0.3 + whiteness_loss * 0.3 + texture_loss * 0.4
+
+    def compute_background_preservation_loss(self, source, target):
+        """Calculate loss for preserving background content and color"""
+        if not self.has_face_parser:
+            return torch.tensor(0.0, device=self.device)
+            
+        # Get background masks using the face parser (background label is 0)
+        source_background = self.extract_background_regions(source)
+        target_background = self.extract_background_regions(target)
+        
+        # If no background is found, return zero loss
+        if source_background is None or target_background is None:
+            return torch.tensor(0.0, device=self.device)
+            
+        # Calculate L1 loss for color preservation in background regions
+        color_loss = F.l1_loss(source_background, target_background)
+        
+        # Calculate perceptual loss for content preservation
+        # We use a combination of low-level features (color) and high-level features (content/structure)
+        background_mask = self.get_background_mask(source)
+        
+        # Apply mask to both source and target images
+        source_masked = source * background_mask
+        target_masked = target * background_mask
+        
+        # Calculate structure similarity for the background regions
+        ssim_loss = 1 - self.calculate_ssim(source_masked, target_masked)
+        
+        # Combine losses with appropriate weights
+        total_loss = color_loss * 0.6 + ssim_loss * 0.4
+        
+        return total_loss
+        
+    def extract_background_regions(self, img):
+        """Extract background regions from an image using face parsing"""
+        # Get face parsing masks
+        masks = self.get_face_parsing_masks(img)
+        
+        # Create background mask (where label is 0)
+        background_mask = (masks == 0).float()
+        
+        # Check if there's enough background
+        if background_mask.sum() < 100:  # Arbitrary threshold, adjust as needed
+            return None
+            
+        # Expand mask to match image channels
+        background_mask = background_mask.unsqueeze(1).expand(-1, img.size(1), -1, -1)
+        
+        # Apply mask to extract background regions
+        background_regions = img * background_mask
+        
+        return background_regions
+        
+    def get_background_mask(self, img):
+        """Get background mask from face parsing"""
+        # Get face parsing masks
+        masks = self.get_face_parsing_masks(img)
+        
+        # Create background mask (where label is 0)
+        background_mask = (masks == 0).float()
+        
+        # Expand mask to match image channels
+        background_mask = background_mask.unsqueeze(1).expand(-1, img.size(1), -1, -1)
+        
+        return background_mask
+        
+    def calculate_ssim(self, img1, img2):
+        """Calculate structural similarity between two images"""
+        # Convert to luminance
+        cs = torch.ones_like(img1[:, 0:1, :, :]) * 0.45
+        lum1 = img1[:, 0:1, :, :] * 0.2126 + img1[:, 1:2, :, :] * 0.7152 + img1[:, 2:3, :, :] * 0.0722
+        lum2 = img2[:, 0:1, :, :] * 0.2126 + img2[:, 1:2, :, :] * 0.7152 + img2[:, 2:3, :, :] * 0.0722
+        
+        # Constants for stability
+        C1 = 0.01 ** 2
+        C2 = 0.03 ** 2
+        
+        # Calculate means and variances
+        mu1 = F.avg_pool2d(lum1, kernel_size=11, stride=1, padding=5)
+        mu2 = F.avg_pool2d(lum2, kernel_size=11, stride=1, padding=5)
+        
+        mu1_sq = mu1.pow(2)
+        mu2_sq = mu2.pow(2)
+        mu1_mu2 = mu1 * mu2
+        
+        sigma1_sq = F.avg_pool2d(lum1 * lum1, kernel_size=11, stride=1, padding=5) - mu1_sq
+        sigma2_sq = F.avg_pool2d(lum2 * lum2, kernel_size=11, stride=1, padding=5) - mu2_sq
+        sigma12 = F.avg_pool2d(lum1 * lum2, kernel_size=11, stride=1, padding=5) - mu1_mu2
+        
+        # Calculate SSIM
+        ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+        
+        # Return mean SSIM
+        return ssim_map.mean()
