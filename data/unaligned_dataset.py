@@ -4,6 +4,7 @@ from data.image_folder import make_dataset
 from PIL import Image
 import random
 import util.util as util
+import re
 
 
 class UnalignedDataset(BaseDataset):
@@ -71,8 +72,67 @@ class UnalignedDataset(BaseDataset):
         else:   # randomize the index for domain B to avoid fixed pairs.
             index_B = random.randint(0, self.B_size - 1)
         B_path = self.B_paths[index_B]
+
         A_img = Image.open(A_path)
         B_img = Image.open(B_path)
+        
+        # Apply random scaling if enabled and path matches pattern
+        if hasattr(self.opt, 'enable_random_scale') and self.opt.enable_random_scale and random.random() < self.opt.enable_random_scale_prob:
+            # Check if A image path matches the pattern
+            if hasattr(self.opt, 'enable_scale_on') and re.search(self.opt.enable_scale_on, A_path):
+                # Random scale factor between 0.33 and 0.9
+                scale_factor = random.uniform(0.33, 0.9)
+                # Get original size
+                orig_width, orig_height = A_img.size
+                # Calculate new size
+                new_width = int(orig_width * scale_factor)
+                new_height = int(orig_height * scale_factor)
+                # Resize image
+                scaled_img = A_img.resize((new_width, new_height), Image.LANCZOS)
+                # Create white background
+                white_bg = Image.new('RGB', (orig_width, orig_height), (255, 255, 255))
+                # Calculate position to center the scaled image
+                paste_x = (orig_width - new_width) // 2
+                paste_y = (orig_height - new_height) // 2
+                # Paste scaled image onto white background
+                white_bg.paste(scaled_img, (paste_x, paste_y))
+                A_img = white_bg
+                
+            # Check if B image path matches the pattern
+            if hasattr(self.opt, 'enable_scale_on') and re.search(self.opt.enable_scale_on, B_path):
+                # Random scale factor between 0.33 and 0.9
+                scale_factor = random.uniform(0.33, 0.9)
+                # Get original size
+                orig_width, orig_height = B_img.size
+                # Calculate new size
+                new_width = int(orig_width * scale_factor)
+                new_height = int(orig_height * scale_factor)
+                # Resize image
+                scaled_img = B_img.resize((new_width, new_height), Image.LANCZOS)
+                # Create white background
+                white_bg = Image.new('RGB', (orig_width, orig_height), (255, 255, 255))
+                # Calculate position to center the scaled image
+                paste_x = (orig_width - new_width) // 2
+                paste_y = (orig_height - new_height) // 2
+                # Paste scaled image onto white background
+                white_bg.paste(scaled_img, (paste_x, paste_y))
+                B_img = white_bg
+        
+        # Apply random rotation if enabled
+        if hasattr(self.opt, 'enable_rotation') and self.opt.enable_rotation and random.random() < self.opt.enable_rotation_prob:
+            # Check if A image path matches the pattern
+            if hasattr(self.opt, 'enable_rotation_on') and re.search(self.opt.enable_scale_on, A_path):
+                # Random rotation angle between -60 and +60 degrees
+                rotation_angle = random.uniform(-60, 60)
+                # Rotate image with white background fill
+                A_img = A_img.rotate(rotation_angle, resample=Image.BICUBIC, expand=False, fillcolor=(255, 255, 255))
+            
+            # Check if B image path matches the pattern
+            if hasattr(self.opt, 'enable_rotation_on') and re.search(self.opt.enable_scale_on, B_path):
+                # Random rotation angle between -60 and +60 degrees
+                rotation_angle = random.uniform(-60, 60)
+                # Rotate image with white background fill
+                B_img = B_img.rotate(rotation_angle, resample=Image.BICUBIC, expand=False, fillcolor=(255, 255, 255))
         
         # Handle alpha channel by compositing against white background
         if A_img.mode in ('RGBA', 'LA') or (A_img.mode == 'P' and 'transparency' in A_img.info):

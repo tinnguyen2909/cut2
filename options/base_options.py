@@ -68,7 +68,12 @@ class BaseOptions():
         parser.add_argument('--stylegan2_G_num_downsampling',
                             default=1, type=int,
                             help='Number of downsampling layers used by StyleGAN2Generator')
-
+        parser.add_argument('--enable_scale_on', type=str, default='.+', help='enable scale on certain datasets')
+        parser.add_argument('--enable_random_scale', type=util.str2bool, nargs='?', const=True, default=False, help='enable random scale')
+        parser.add_argument('--enable_random_scale_prob', type=float, default=0.5, help='probability of enabling random scale')
+        parser.add_argument('--enable_rotation', type=util.str2bool, nargs='?', const=True, default=False, help='enable rotation')
+        parser.add_argument('--enable_rotation_on', type=str, default='.+', help='enable rotation on certain datasets')
+        parser.add_argument('--enable_rotation_prob', type=float, default=0.5, help='probability of enabling rotation')
         self.initialized = True
         return parser
 

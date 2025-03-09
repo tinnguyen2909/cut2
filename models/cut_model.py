@@ -39,25 +39,25 @@ class CUTModel(BaseModel):
                             help="Enforce flip-equivariance as additional regularization. It's used by FastCUT, but not CUT")
         
         # Add new options for eye color and skin tone preservation
-        parser.add_argument('--lambda_eye', type=float, default=5.0, help='weight for eye color preservation loss')
-        parser.add_argument('--lambda_skin', type=float, default=1.0, help='weight for skin tone preservation loss')
+        parser.add_argument('--lambda_eye', type=float, default=0.0, help='weight for eye color preservation loss')
+        parser.add_argument('--lambda_skin', type=float, default=0.0, help='weight for skin tone preservation loss')
         parser.add_argument('--use_face_parser', type=util.str2bool, default=True, help='use face parsing model for precise feature extraction')
-        parser.add_argument('--lambda_segmentation', type=float, default=5.0, help='weight for segmentation consistency loss')
+        parser.add_argument('--lambda_segmentation', type=float, default=0.0, help='weight for segmentation consistency loss')
 
         # Add new options for edge preservation and color consistency
-        parser.add_argument('--lambda_edge', type=float, default=5.0, help='weight for edge preservation loss')
-        parser.add_argument('--lambda_color_consistency', type=float, default=3.0, help='weight for color consistency loss to prevent bleeding')
+        parser.add_argument('--lambda_edge', type=float, default=0.0, help='weight for edge preservation loss')
+        parser.add_argument('--lambda_color_consistency', type=float, default=0.0, help='weight for color consistency loss to prevent bleeding')
         parser.add_argument('--edge_threshold', type=float, default=0.05, help='threshold for detecting important edges')
 
         # Add option for ethnicity preservation
-        parser.add_argument('--lambda_ethnicity', type=float, default=2.0, help='weight for ethnicity preservation loss')
+        parser.add_argument('--lambda_ethnicity', type=float, default=0.0, help='weight for ethnicity preservation loss')
 
         # Add options for lips and teeth preservation
-        parser.add_argument('--lambda_lips', type=float, default=2.0, help='weight for lips shape and color preservation loss')
-        parser.add_argument('--lambda_teeth', type=float, default=2.0, help='weight for teeth preservation loss')
+        parser.add_argument('--lambda_lips', type=float, default=0.0, help='weight for lips shape and color preservation loss')
+        parser.add_argument('--lambda_teeth', type=float, default=0.0, help='weight for teeth preservation loss')
 
         # Add option for background preservation
-        parser.add_argument('--lambda_background', type=float, default=2.0, help='weight for background content and color preservation loss')
+        parser.add_argument('--lambda_background', type=float, default=0.0, help='weight for background content and color preservation loss')
 
         # Face preservation parameters
         parser.add_argument('--face_preservation', type=util.str2bool, default=False, 
