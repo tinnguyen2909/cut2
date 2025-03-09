@@ -101,7 +101,7 @@ class UnalignedDataset(BaseDataset):
             # Check if B image path matches the pattern
             if hasattr(self.opt, 'enable_scale_on') and re.search(self.opt.enable_scale_on, B_path):
                 # Random scale factor between 0.33 and 0.9
-                scale_factor = random.uniform(0.33, 0.9)
+                scale_factor = random.uniform(0.33, 0.6)
                 # Get original size
                 orig_width, orig_height = B_img.size
                 # Calculate new size
