@@ -75,7 +75,20 @@ class UnalignedDataset(BaseDataset):
 
         A_img = Image.open(A_path)
         B_img = Image.open(B_path)
-        
+        # Handle alpha channel by compositing against white background
+        if A_img.mode in ('RGBA', 'LA') or (A_img.mode == 'P' and 'transparency' in A_img.info):
+            # Create a white background image
+            white_bg = Image.new('RGBA', A_img.size, (255, 255, 255, 255))
+            # Paste the image on the background
+            white_bg.paste(A_img, (0, 0), A_img)
+            A_img = white_bg
+            
+        if B_img.mode in ('RGBA', 'LA') or (B_img.mode == 'P' and 'transparency' in B_img.info):
+            # Create a white background image
+            white_bg = Image.new('RGBA', B_img.size, (255, 255, 255, 255))
+            # Paste the image on the background
+            white_bg.paste(B_img, (0, 0), B_img)
+            B_img = white_bg
         # Apply random scaling if enabled and path matches pattern
         if hasattr(self.opt, 'enable_random_scale') and self.opt.enable_random_scale and random.random() < self.opt.enable_random_scale_prob:
             # Check if A image path matches the pattern
@@ -134,20 +147,7 @@ class UnalignedDataset(BaseDataset):
                 # Rotate image with white background fill
                 B_img = B_img.rotate(rotation_angle, resample=Image.BICUBIC, expand=False, fillcolor=(255, 255, 255))
         
-        # Handle alpha channel by compositing against white background
-        if A_img.mode in ('RGBA', 'LA') or (A_img.mode == 'P' and 'transparency' in A_img.info):
-            # Create a white background image
-            white_bg = Image.new('RGBA', A_img.size, (255, 255, 255, 255))
-            # Paste the image on the background
-            white_bg.paste(A_img, (0, 0), A_img)
-            A_img = white_bg
-            
-        if B_img.mode in ('RGBA', 'LA') or (B_img.mode == 'P' and 'transparency' in B_img.info):
-            # Create a white background image
-            white_bg = Image.new('RGBA', B_img.size, (255, 255, 255, 255))
-            # Paste the image on the background
-            white_bg.paste(B_img, (0, 0), B_img)
-            B_img = white_bg
+
             
         # Convert to RGB
         A_img = A_img.convert('RGB')
