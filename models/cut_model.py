@@ -40,7 +40,6 @@ class CUTModel(BaseModel):
         
         # Add new options for eye color and skin tone preservation
         parser.add_argument('--lambda_eye', type=float, default=0.0, help='weight for eye color preservation loss')
-        parser.add_argument('--lambda_skin', type=float, default=0.0, help='weight for skin tone preservation loss')
         parser.add_argument('--use_face_parser', type=util.str2bool, default=True, help='use face parsing model for precise feature extraction')
         parser.add_argument('--lambda_segmentation', type=float, default=0.0, help='weight for segmentation consistency loss')
 
@@ -52,9 +51,6 @@ class CUTModel(BaseModel):
         # Add option for ethnicity preservation
         parser.add_argument('--lambda_ethnicity', type=float, default=0.0, help='weight for ethnicity preservation loss')
 
-        # Add options for lips and teeth preservation
-        parser.add_argument('--lambda_lips', type=float, default=0.0, help='weight for lips shape and color preservation loss')
-        parser.add_argument('--lambda_teeth', type=float, default=0.0, help='weight for teeth preservation loss')
 
         # Add option for background preservation
         parser.add_argument('--lambda_background', type=float, default=0.0, help='weight for background content and color preservation loss')
@@ -108,8 +104,7 @@ class CUTModel(BaseModel):
         # Add new losses for eye color and skin tone preservation
         if opt.lambda_eye > 0.0:
             self.loss_names.append('eye')
-        if opt.lambda_skin > 0.0:
-            self.loss_names.append('skin')
+
         # Add segmentation loss
         if opt.lambda_segmentation > 0.0:
             self.loss_names.append('segmentation')
@@ -122,11 +117,6 @@ class CUTModel(BaseModel):
         # Add ethnicity preservation loss
         if opt.lambda_ethnicity > 0.0:
             self.loss_names.append('ethnicity')
-        # Add lips and teeth preservation losses
-        if opt.lambda_lips > 0.0:
-            self.loss_names.append('lips')
-        if opt.lambda_teeth > 0.0:
-            self.loss_names.append('teeth')
         
         # Add background preservation loss
         if opt.lambda_background > 0.0:
@@ -164,10 +154,7 @@ class CUTModel(BaseModel):
             # Initialize face parser if needed
             if (
                 opt.lambda_eye > 0.0 or 
-                opt.lambda_skin > 0.0 or
                 opt.lambda_background > 0.0 or
-                opt.lambda_lips > 0.0 or
-                opt.lambda_teeth > 0.0 or
                 opt.lambda_segmentation > 0.0 or
                 (opt.lambda_face_preservation > 0.0 and opt.face_preservation)
             ) and opt.use_face_parser:
@@ -343,24 +330,6 @@ class CUTModel(BaseModel):
             eye_region = img[:, :, h//5:h//2, w//4:3*w//4]
             return F.interpolate(eye_region, size=(64, 128), mode='bilinear')
 
-    def extract_skin_regions(self, img):
-        """Extract skin regions from an image using face parsing or simple heuristic"""
-        if self.has_face_parser:
-            # Get face parsing masks
-            masks = self.get_face_parsing_masks(img)
-            
-            # Create skin mask
-            skin_mask = (masks == self.skin_label).float().unsqueeze(1)
-            
-            # Apply mask to get skin regions
-            skin_regions = img * skin_mask
-            
-            return skin_regions
-        else:
-            # Fallback to simple heuristic
-            b, c, h, w = img.size()
-            return img[:, :, h//4:3*h//4, w//4:3*w//4]
-
     def compute_eye_color_loss(self, src, tgt):
         """Calculate loss for preserving eye color"""
         src_eyes = self.extract_eye_regions(src)
@@ -395,35 +364,6 @@ class CUTModel(BaseModel):
         else:
             return torch.tensor(0.0, device=self.device)
 
-    def compute_skin_tone_loss(self, src, tgt):
-        """Calculate loss for preserving skin tone"""
-        src_skin = self.extract_skin_regions(src)
-        tgt_skin = self.extract_skin_regions(tgt)
-        
-        if self.has_face_parser:
-            # Create binary mask of non-zero pixels (where skin was detected)
-            src_mask = (torch.sum(src_skin, dim=1, keepdim=True) != 0).float()
-            tgt_mask = (torch.sum(tgt_skin, dim=1, keepdim=True) != 0).float()
-            
-            # Combine masks
-            combined_mask = src_mask * tgt_mask
-            
-            # If no skin pixels are detected, return zero loss
-            if combined_mask.sum() < 1.0:
-                return torch.tensor(0.0, device=self.device)
-            
-            # Calculate color statistics on masked regions
-            src_mean = torch.sum(src_skin * combined_mask, dim=[2, 3]) / torch.sum(combined_mask, dim=[2, 3])
-            tgt_mean = torch.sum(tgt_skin * combined_mask, dim=[2, 3]) / torch.sum(combined_mask, dim=[2, 3])
-            
-            # Compare color distributions
-            return F.l1_loss(src_mean, tgt_mean)
-        else:
-            # Simple color statistics for heuristic method
-            src_mean = torch.mean(src_skin, dim=[2, 3])  # Average over spatial dimensions
-            tgt_mean = torch.mean(tgt_skin, dim=[2, 3])
-            
-            return F.l1_loss(src_mean, tgt_mean)
 
     def forward(self):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
@@ -617,12 +557,6 @@ class CUTModel(BaseModel):
         else:
             self.loss_eye = 0.0
             
-        # Calculate skin tone preservation loss
-        if self.opt.lambda_skin > 0.0:
-            self.loss_skin = self.compute_skin_tone_loss(self.real_A, self.fake_B) * self.opt.lambda_skin
-        else:
-            self.loss_skin = 0.0
-            
         # Calculate segmentation consistency loss
         if self.opt.lambda_segmentation > 0.0:
             self.loss_segmentation = self.compute_segmentation_loss(self.real_A, self.fake_B) * self.opt.lambda_segmentation
@@ -647,17 +581,6 @@ class CUTModel(BaseModel):
         else:
             self.loss_ethnicity = 0.0
             
-        # Calculate lips preservation loss
-        if self.opt.lambda_lips > 0.0:
-            self.loss_lips = self.compute_lips_preservation_loss(self.real_A, self.fake_B) * self.opt.lambda_lips
-        else:
-            self.loss_lips = 0.0
-            
-        # Calculate teeth preservation loss
-        if self.opt.lambda_teeth > 0.0:
-            self.loss_teeth = self.compute_teeth_preservation_loss(self.real_A, self.fake_B) * self.opt.lambda_teeth
-        else:
-            self.loss_teeth = 0.0
 
         # Calculate background preservation loss
         if self.opt.lambda_background > 0.0:
@@ -717,13 +640,13 @@ class CUTModel(BaseModel):
                 self.face_area_ratio = face_area_ratio.mean().item()
                 
             # Add to total loss
-            loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_eye + self.loss_skin + \
+            loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_eye +  \
                      self.loss_segmentation + self.loss_edge + self.loss_color + self.loss_ethnicity + \
-                     self.loss_lips + self.loss_teeth + self.loss_background + self.loss_face_preservation
+                     self.loss_background + self.loss_face_preservation
         else:
-            loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_eye + self.loss_skin + \
+            loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_eye + \
                      self.loss_segmentation + self.loss_edge + self.loss_color + self.loss_ethnicity + \
-                     self.loss_lips + self.loss_teeth + self.loss_background
+                     self.loss_background
 
         return loss_G
 
@@ -956,123 +879,6 @@ class CUTModel(BaseModel):
             
         return final_loss
 
-    def extract_lip_regions(self, img):
-        """Extract lip regions from an image using face parsing"""
-        if self.has_face_parser:
-            # Get face parsing masks
-            masks = self.get_face_parsing_masks(img)
-            
-            # Create lip mask (upper and lower lips)
-            lip_mask = ((masks == 11) | (masks == 12)).float().unsqueeze(1)  # 11: u_lip, 12: l_lip
-            
-            # Apply mask to get lip regions
-            lip_regions = img * lip_mask
-            
-            return lip_regions, lip_mask
-        else:
-            # Fallback to simple heuristic if face parser not available
-            b, c, h, w = img.size()
-            # Create a mask with the same dimensions as the original image
-            mask = torch.zeros((b, 1, h, w), device=img.device)
-            mask[:, :, h//2:3*h//4, w//3:2*w//3] = 1
-            
-            # Apply mask to get mouth region
-            mouth_region = img * mask
-            
-            return mouth_region, mask
-
-    def extract_teeth_regions(self, img):
-        """Extract teeth/inner mouth regions using face parsing"""
-        if self.has_face_parser:
-            # Get face parsing masks
-            masks = self.get_face_parsing_masks(img)
-            
-            # Create mouth mask
-            mouth_mask = (masks == 10).float().unsqueeze(1)  # 10: mouth
-            
-            # Apply mask to get inner mouth/teeth regions
-            teeth_regions = img * mouth_mask
-            
-            return teeth_regions, mouth_mask
-        else:
-            # Simple fallback
-            b, c, h, w = img.size()
-            # Create a mask with the same dimensions as the original image
-            mask = torch.zeros((b, 1, h, w), device=img.device)
-            mask[:, :, h//2:3*h//4, w//3+w//12:2*w//3-w//12] = 1
-            
-            # Apply mask to get teeth region
-            teeth_region = img * mask
-            
-            return teeth_region, mask
-
-    def compute_lips_preservation_loss(self, src, tgt):
-        """Calculate loss for preserving lip shape and color"""
-        src_lips, src_mask = self.extract_lip_regions(src)
-        tgt_lips, tgt_mask = self.extract_lip_regions(tgt)
-        
-        # Create combined mask - only consider pixels where both source and target detected lips
-        combined_mask = src_mask * tgt_mask
-        
-        # If no lip pixels are detected, return zero loss
-        if combined_mask.sum() < 1.0:
-            return torch.tensor(0.0, device=self.device)
-        
-        # Apply mask
-        src_lips_masked = src_lips * combined_mask
-        tgt_lips_masked = tgt_lips * combined_mask
-        
-        # Calculate color statistics
-        src_mean = torch.sum(src_lips_masked, dim=[2, 3]) / (combined_mask.sum() + 1e-6)
-        
-        # Calculate shape and color preservation losses
-        color_loss = F.l1_loss(src_mean, tgt_mean)
-        
-        # For shape preservation, we use both texture and edge losses
-        texture_loss = F.l1_loss(src_lips_masked, tgt_lips_masked)
-        
-        # Detect edges in the lip regions for shape analysis
-        src_lips_edges, _, _ = self.detect_edges(src_lips_masked)
-        tgt_lips_edges, _, _ = self.detect_edges(tgt_lips_masked)
-        edge_loss = F.l1_loss(src_lips_edges, tgt_lips_edges)
-        
-        # Combine losses with appropriate weights
-        return color_loss * 0.3 + texture_loss * 0.4 + edge_loss * 0.3
-
-    def compute_teeth_preservation_loss(self, src, tgt):
-        """Calculate loss for preserving teeth appearance"""
-        src_teeth, src_mask = self.extract_teeth_regions(src)
-        tgt_teeth, tgt_mask = self.extract_teeth_regions(tgt)
-        
-        # Create combined mask
-        combined_mask = src_mask * tgt_mask
-        
-        # If no teeth/mouth pixels are detected, return zero loss
-        if combined_mask.sum() < 1.0:
-            return torch.tensor(0.0, device=self.device)
-        
-        # Apply mask
-        src_teeth_masked = src_teeth * combined_mask
-        tgt_teeth_masked = tgt_teeth * combined_mask
-        
-        # For teeth, brightness and whiteness are important
-        # Calculate brightness
-        src_brightness = torch.mean(src_teeth_masked, dim=1, keepdim=True)
-        tgt_brightness = torch.mean(tgt_teeth_masked, dim=1, keepdim=True)
-        
-        # Calculate whiteness (how close to white)
-        # White has equal RGB values close to 1, so we penalize deviation from this pattern
-        src_whiteness = torch.std(src_teeth_masked, dim=1, keepdim=True)  # Lower std means more equal RGB values
-        tgt_whiteness = torch.std(tgt_teeth_masked, dim=1, keepdim=True)
-        
-        # Calculate teeth preservation losses
-        brightness_loss = F.l1_loss(src_brightness, tgt_brightness)
-        whiteness_loss = F.l1_loss(src_whiteness, tgt_whiteness)
-        texture_loss = F.l1_loss(src_teeth_masked, tgt_teeth_masked)
-        
-        # Combine losses
-        return brightness_loss * 0.3 + whiteness_loss * 0.3 + texture_loss * 0.4
-
     def compute_background_preservation_loss(self, source, target):
         """Calculate loss for preserving background content and color"""
         if not self.has_face_parser:
@@ -1176,59 +982,37 @@ class CUTModel(BaseModel):
         face_mask = torch.zeros((batch_size, 1, h, w), device=img.device)
         
         # If we have face parsing capability, use it directly
-        if hasattr(self, 'has_face_parser') and self.has_face_parser:
-            parsing_masks = self.get_face_parsing_masks(img)
-            
-            # Based on the face parser configuration, define facial features
-            # Map of semantic labels from config.json
-            face_feature_labels = [
-                1,   # skin
-                2,   # nose
-                3,   # eye_g (glasses)
-                4,   # l_eye
-                5,   # r_eye
-                6,   # l_brow
-                7,   # r_brow
-                10,  # mouth
-                11,  # u_lip
-                12,  # l_lip
-            ]
-            
-            # Optional: include ears, neck in face mask
-            if hasattr(self.opt, 'include_ears_in_face') and self.opt.include_ears_in_face:
-                face_feature_labels.extend([8, 9])  # left ear, right ear
-            
-            if hasattr(self.opt, 'include_neck_in_face') and self.opt.include_neck_in_face:
-                face_feature_labels.extend([16, 17])  # neck_l, neck
-            
-            # Create facial features mask
-            facial_features_mask = torch.zeros_like(parsing_masks, dtype=torch.bool)
-            for label in face_feature_labels:
-                facial_features_mask = torch.logical_or(facial_features_mask, parsing_masks == label)
-            
-            # Convert to float and add channel dimension
-            face_mask = facial_features_mask.float().unsqueeze(1)
-        else:
-            # Fallback to component-based approach if face parser not available
-            # Add eye regions to mask
-            if hasattr(self, 'extract_eye_regions'):
-                _, eye_mask = self.extract_eye_regions(img)
-                face_mask = torch.max(face_mask, eye_mask)
-            
-            # Add skin regions to mask
-            if hasattr(self, 'extract_skin_regions'):
-                _, skin_mask = self.extract_skin_regions(img)
-                face_mask = torch.max(face_mask, skin_mask)
-            
-            # Add lip regions to mask
-            if hasattr(self, 'extract_lip_regions'):
-                _, lip_mask = self.extract_lip_regions(img)
-                face_mask = torch.max(face_mask, lip_mask)
-            
-            # Add teeth regions to mask
-            if hasattr(self, 'extract_teeth_regions'):
-                _, teeth_mask = self.extract_teeth_regions(img)
-                face_mask = torch.max(face_mask, teeth_mask)
+        parsing_masks = self.get_face_parsing_masks(img)
+        
+        # Based on the face parser configuration, define facial features
+        # Map of semantic labels from config.json
+        face_feature_labels = [
+            1,   # skin
+            2,   # nose
+            3,   # eye_g (glasses)
+            4,   # l_eye
+            5,   # r_eye
+            6,   # l_brow
+            7,   # r_brow
+            10,  # mouth
+            11,  # u_lip
+            12,  # l_lip
+        ]
+        
+        # Optional: include ears, neck in face mask
+        if hasattr(self.opt, 'include_ears_in_face') and self.opt.include_ears_in_face:
+            face_feature_labels.extend([8, 9])  # left ear, right ear
+        
+        if hasattr(self.opt, 'include_neck_in_face') and self.opt.include_neck_in_face:
+            face_feature_labels.extend([16, 17])  # neck_l, neck
+        
+        # Create facial features mask
+        facial_features_mask = torch.zeros_like(parsing_masks, dtype=torch.bool)
+        for label in face_feature_labels:
+            facial_features_mask = torch.logical_or(facial_features_mask, parsing_masks == label)
+        
+        # Convert to float and add channel dimension
+        face_mask = facial_features_mask.float().unsqueeze(1)
         
         # Optionally dilate the mask to include a small border around the face
         if hasattr(self.opt, 'face_mask_dilation') and self.opt.face_mask_dilation > 0:
