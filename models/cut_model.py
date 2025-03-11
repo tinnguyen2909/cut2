@@ -601,7 +601,7 @@ class CUTModel(BaseModel):
             self.loss_face_preservation = torch.tensor(0.0, device=self.device)
             
             # Check if batch contains images with faces larger than threshold (20%)
-            face_threshold = 0.20  # 20% threshold
+            face_threshold = 0.10  # 10% threshold
             has_significant_face = face_area_ratio > face_threshold
             
             if has_significant_face.any():
