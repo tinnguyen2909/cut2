@@ -73,6 +73,10 @@ class CUTModel(BaseModel):
         parser.add_argument('--face_mask_dilation', type=int, default=5, 
                            help='dilation of face mask in pixels to create smooth transitions')
 
+        # Add new options for non-face color preservation
+        parser.add_argument('--lambda_non_face_color', type=float, default=0.0, 
+                           help='weight for preserving colors in non-face regions')
+
         opt, _ = parser.parse_known_args()
 
         # Set default parameters for CUT and FastCUT
@@ -156,6 +160,7 @@ class CUTModel(BaseModel):
                 opt.lambda_eye > 0.0 or 
                 opt.lambda_background > 0.0 or
                 opt.lambda_segmentation > 0.0 or
+                opt.lambda_non_face_color > 0.0 or
                 (opt.lambda_face_preservation > 0.0 and opt.face_preservation)
             ) and opt.use_face_parser:
                 try:
@@ -648,6 +653,19 @@ class CUTModel(BaseModel):
                      self.loss_segmentation + self.loss_edge + self.loss_color + self.loss_ethnicity + \
                      self.loss_background
 
+        # Add non-face color preservation loss
+        if self.opt.lambda_non_face_color > 0.0:
+            self.loss_names.append('non_face_color')
+
+        # Calculate non-face color preservation loss
+        if self.opt.lambda_non_face_color > 0.0:
+            self.loss_non_face_color = self.compute_non_face_color_preservation_loss(self.real_A, self.fake_B) * self.opt.lambda_non_face_color
+        else:
+            self.loss_non_face_color = 0.0
+            
+        # Add to total loss
+        loss_G += self.loss_non_face_color
+
         return loss_G
 
     def calculate_NCE_loss(self, src, tgt):
@@ -1086,3 +1104,73 @@ class CUTModel(BaseModel):
             overlay[i, :, 5:15, 20:100] = text_color.view(3, 1, 1) * 0.8
         
         return overlay
+
+    def compute_non_face_color_preservation_loss(self, source, target):
+        """Calculate loss for preserving colors in non-face regions
+        
+        Args:
+            source (tensor): Source image tensor [B, C, H, W]
+            target (tensor): Target image tensor [B, C, H, W]
+            
+        Returns:
+            tensor: Non-face color preservation loss
+        """
+        # Get face masks
+        face_masks = self.get_face_masks(source)
+        
+        # Invert masks to get non-face regions (add small epsilon to avoid division by zero)
+        non_face_masks = 1.0 - face_masks
+        
+        # Skip the loss if there are no significant non-face regions
+        if non_face_masks.mean() < 0.1:  # Less than 10% of the image is non-face
+            return torch.tensor(0.0, device=source.device)
+        
+        # Apply masks to focus only on non-face regions
+        source_non_face = source * non_face_masks
+        target_non_face = target * non_face_masks
+        
+        # Calculate color preservation loss (L1 loss)
+        color_loss = F.l1_loss(source_non_face, target_non_face, reduction='sum') / (non_face_masks.sum() + 1e-6)
+        
+        # Additionally calculate color statistics preservation
+        # Extract per-channel mean and standard deviation for non-face regions
+        source_mean = []
+        target_mean = []
+        source_std = []
+        target_std = []
+        
+        for c in range(source.size(1)):  # For each channel
+            # Calculate weighted mean and std using the mask as weights
+            src_channel = source[:, c:c+1, :, :]
+            tgt_channel = target[:, c:c+1, :, :]
+            
+            # Weighted means
+            src_mean_c = (src_channel * non_face_masks).sum(dim=[2, 3]) / (non_face_masks.sum(dim=[2, 3]) + 1e-6)
+            tgt_mean_c = (tgt_channel * non_face_masks).sum(dim=[2, 3]) / (non_face_masks.sum(dim=[2, 3]) + 1e-6)
+            
+            # Weighted standard deviations
+            src_diff_sq = ((src_channel - src_mean_c.view(-1, 1, 1, 1)) ** 2) * non_face_masks
+            tgt_diff_sq = ((tgt_channel - tgt_mean_c.view(-1, 1, 1, 1)) ** 2) * non_face_masks
+            
+            src_std_c = torch.sqrt(src_diff_sq.sum(dim=[2, 3]) / (non_face_masks.sum(dim=[2, 3]) + 1e-6))
+            tgt_std_c = torch.sqrt(tgt_diff_sq.sum(dim=[2, 3]) / (non_face_masks.sum(dim=[2, 3]) + 1e-6))
+            
+            source_mean.append(src_mean_c)
+            target_mean.append(tgt_mean_c)
+            source_std.append(src_std_c)
+            target_std.append(tgt_std_c)
+        
+        # Combine channel statistics
+        source_mean = torch.cat(source_mean, dim=1)
+        target_mean = torch.cat(target_mean, dim=1)
+        source_std = torch.cat(source_std, dim=1)
+        target_std = torch.cat(target_std, dim=1)
+        
+        # Calculate mean and standard deviation preservation losses
+        mean_loss = F.l1_loss(source_mean, target_mean)
+        std_loss = F.l1_loss(source_std, target_std)
+        
+        # Combine losses: pixel-wise color loss + color statistics loss
+        total_loss = 0.7 * color_loss + 0.2 * mean_loss + 0.1 * std_loss
+        
+        return total_loss
