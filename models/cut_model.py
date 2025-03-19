@@ -38,6 +38,14 @@ class CUTModel(BaseModel):
                             type=util.str2bool, nargs='?', const=True, default=False,
                             help="Enforce flip-equivariance as additional regularization. It's used by FastCUT, but not CUT")
         
+        # Add attention mechanism options
+        parser.add_argument('--attention_layers', type=str, default="16,20", 
+                          help='apply attention on which generator layers (comma-separated layer indices)')
+        parser.add_argument('--attention_heads', type=int, default=4,
+                          help='number of attention heads in multihead attention')
+        parser.add_argument('--use_attention', type=util.str2bool, default=False,
+                          help='enable attention mechanism in generator')
+        
         # Add new options for eye color and skin tone preservation
         parser.add_argument('--lambda_eye', type=float, default=0.0, help='weight for eye color preservation loss')
         parser.add_argument('--use_face_parser', type=util.str2bool, default=True, help='use face parsing model for precise feature extraction')

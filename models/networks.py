@@ -985,6 +985,42 @@ class ResnetGenerator(nn.Module):
         model += [nn.Tanh()]
 
         self.model = nn.Sequential(*model)
+        
+        # Initialize attention layers and parameters
+        self.attention_layers = []
+        self.use_attention = False
+        if opt is not None and hasattr(opt, 'attention_layers') and opt.attention_layers:
+            # Only enable attention if use_attention is True (default False)
+            if hasattr(opt, 'use_attention') and opt.use_attention:
+                self.use_attention = True
+                self.attention_layers = [int(l) for l in opt.attention_layers.split(',')]
+                self.attention_heads = opt.attention_heads if hasattr(opt, 'attention_heads') else 4
+                self.attention_modules = nn.ModuleDict()
+                
+                # Create attention modules for each specified layer
+                for layer_id in self.attention_layers:
+                    if layer_id < len(model):
+                        # Get the channel size at this layer
+                        with torch.no_grad():
+                            dummy_input = torch.zeros(1, input_nc, 256, 256)  # Example size
+                            for l in range(layer_id):
+                                dummy_input = model[l](dummy_input)
+                            feature_dim = dummy_input.shape[1]
+                        
+                        # Create MultiheadAttention module
+                        self.attention_modules[f'attn_{layer_id}'] = nn.MultiheadAttention(
+                            embed_dim=feature_dim,
+                            num_heads=self.attention_heads,
+                            batch_first=True
+                        )
+                        
+                        # Add layer normalization for better attention stability
+                        self.attention_modules[f'norm_{layer_id}'] = nn.LayerNorm(feature_dim)
+                        
+                print(f"Initialized attention on layers {self.attention_layers} with {self.attention_heads} heads per layer")
+            else:
+                print("Attention layers defined but attention is disabled (use_attention=False)")
+                self.use_attention = False
 
     def forward(self, input, layers=[], encode_only=False):
         if -1 in layers:
@@ -993,23 +1029,71 @@ class ResnetGenerator(nn.Module):
             feat = input
             feats = []
             for layer_id, layer in enumerate(self.model):
-                # print(layer_id, layer)
+                # Apply the layer
                 feat = layer(feat)
+                
+                # Apply attention if this is an attention layer
+                if self.use_attention and layer_id in self.attention_layers:
+                    # Save original shape
+                    b, c, h, w = feat.shape
+                    
+                    # Reshape for attention: [B, C, H, W] -> [B, H*W, C]
+                    feat_reshaped = feat.flatten(2).permute(0, 2, 1)
+                    
+                    # Apply attention - query, key, value are the same for self-attention
+                    attn_output, _ = self.attention_modules[f'attn_{layer_id}'](
+                        feat_reshaped, feat_reshaped, feat_reshaped
+                    )
+                    
+                    # Apply layer norm
+                    attn_output = self.attention_modules[f'norm_{layer_id}'](attn_output)
+                    
+                    # Reshape back to original shape: [B, H*W, C] -> [B, C, H, W]
+                    attn_output = attn_output.permute(0, 2, 1).reshape(b, c, h, w)
+                    
+                    # Residual connection
+                    feat = feat + attn_output
+                
                 if layer_id in layers:
-                    # print("%d: adding the output of %s %d" % (layer_id, layer.__class__.__name__, feat.size(1)))
                     feats.append(feat)
-                else:
-                    # print("%d: skipping %s %d" % (layer_id, layer.__class__.__name__, feat.size(1)))
-                    pass
                 if layer_id == layers[-1] and encode_only:
-                    # print('encoder only return features')
-                    return feats  # return intermediate features alone; stop in the last layers
-
-            return feat, feats  # return both output and intermediate features
+                    return feats
+                
+            return feat, feats
         else:
             """Standard forward"""
-            fake = self.model(input)
-            return fake
+            if not self.use_attention:
+                # Fast path when no attention is used
+                return self.model(input)
+            
+            # Apply layers with attention
+            feat = input
+            for layer_id, layer in enumerate(self.model):
+                feat = layer(feat)
+                
+                # Apply attention if this is an attention layer
+                if layer_id in self.attention_layers:
+                    # Save original shape
+                    b, c, h, w = feat.shape
+                    
+                    # Reshape for attention: [B, C, H, W] -> [B, H*W, C]
+                    feat_reshaped = feat.flatten(2).permute(0, 2, 1)
+                    
+                    # Apply attention - query, key, value are the same for self-attention
+                    attn_output, _ = self.attention_modules[f'attn_{layer_id}'](
+                        feat_reshaped, feat_reshaped, feat_reshaped
+                    )
+                    
+                    # Apply layer norm
+                    attn_output = self.attention_modules[f'norm_{layer_id}'](attn_output)
+                    
+                    # Reshape back to original shape: [B, H*W, C] -> [B, C, H, W]
+                    attn_output = attn_output.permute(0, 2, 1).reshape(b, c, h, w)
+                    
+                    # Residual connection
+                    feat = feat + attn_output
+            
+            return feat
 
 
 class ResnetDecoder(nn.Module):

@@ -221,6 +221,24 @@ class BaseModel(ABC):
                 # patch InstanceNorm checkpoints prior to 0.4
                 # for key in list(state_dict.keys()):  # need to copy keys here because we mutate in loop
                 #    self.__patch_instance_norm_state_dict(state_dict, net, key.split('.'))
+
+                # Handle case where loading model trained without attention into model with attention
+                model_dict = net.state_dict()
+                # Find matching keys while ignoring attention modules
+                pretrained_dict = {k: v for k, v in state_dict.items() if k in model_dict}
+                
+                # Check if any attention parameters are missing (from model trained without attention)
+                missing_keys = [k for k in model_dict.keys() if k not in pretrained_dict]
+                attention_keys = [k for k in missing_keys if 'attention_modules' in k]
+                
+                if len(attention_keys) > 0:
+                    print(f"Info: Loading checkpoint from model without attention layers into model with attention.")
+                    print(f"      {len(attention_keys)} attention parameters will be initialized with default values.")
+                
+                # Update the state dict with matching parameters
+                model_dict.update(pretrained_dict)
+                state_dict = model_dict
+
                 net.load_state_dict(state_dict)
 
     def print_networks(self, verbose):
