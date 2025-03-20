@@ -71,6 +71,12 @@ class CUTModel(BaseModel):
         parser.add_argument('--stage1_checkpoint', type=str, default='',
                            help='path to stage 1 model checkpoint for face preservation')
         
+        # Add non-face preservation parameters
+        parser.add_argument('--non_face_preservation', type=util.str2bool, default=False,
+                           help='preserve non-face regions during training')
+        parser.add_argument('--lambda_non_face_preservation', type=float, default=10.0,
+                           help='weight for non-face preservation loss')
+        
         parser.set_defaults(pool_size=0)  # no image pooling
 
         # Add new options for face mask
@@ -169,7 +175,8 @@ class CUTModel(BaseModel):
                 opt.lambda_background > 0.0 or
                 opt.lambda_segmentation > 0.0 or
                 opt.lambda_non_face_color > 0.0 or
-                (opt.lambda_face_preservation > 0.0 and opt.face_preservation)
+                (opt.lambda_face_preservation > 0.0 and opt.face_preservation) or
+                (opt.lambda_non_face_preservation > 0.0 and opt.non_face_preservation)
             ) and opt.use_face_parser:
                 try:
                     from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
@@ -221,6 +228,13 @@ class CUTModel(BaseModel):
 
             # Create visualization of face mask for the first image in batch
             self.face_mask_vis = None
+            
+        # Add non-face preservation loss
+        if opt.non_face_preservation and opt.lambda_non_face_preservation > 0.0:
+            self.loss_names.append('non_face_preservation')
+            
+            # Create visualization of non-face mask
+            self.non_face_mask_vis = None
 
     def data_dependent_initialize(self, data):
         """
@@ -660,6 +674,11 @@ class CUTModel(BaseModel):
             loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_eye + \
                      self.loss_segmentation + self.loss_edge + self.loss_color + self.loss_ethnicity + \
                      self.loss_background
+
+        # Add non-face preservation loss
+        if self.opt.non_face_preservation and self.opt.lambda_non_face_preservation > 0.0:
+            self.loss_non_face_preservation = self.compute_non_face_preservation_loss(self.real_A, self.fake_B)
+            loss_G += self.loss_non_face_preservation
 
         # Add non-face color preservation loss
         if self.opt.lambda_non_face_color > 0.0:
@@ -1182,3 +1201,40 @@ class CUTModel(BaseModel):
         total_loss = 0.7 * color_loss + 0.2 * mean_loss + 0.1 * std_loss
         
         return total_loss
+
+    def compute_non_face_preservation_loss(self, source, target):
+        """Calculate loss for preserving everything except face regions
+        
+        Args:
+            source (tensor): Source image tensor [B, C, H, W]
+            target (tensor): Target image tensor [B, C, H, W]
+            
+        Returns:
+            tensor: Non-face preservation loss
+        """
+        # Get face masks
+        face_masks = self.get_face_masks(source)
+        
+        # Invert masks to get non-face regions
+        non_face_masks = 1.0 - face_masks
+        
+        # Skip the loss if there are no significant non-face regions
+        if non_face_masks.mean() < 0.1:  # Less than 10% of the image is non-face
+            return torch.tensor(0.0, device=source.device)
+        
+        # Apply masks to focus only on non-face regions
+        source_non_face = source * non_face_masks
+        target_non_face = target * non_face_masks
+        
+        # Calculate L1 loss for non-face regions
+        # Scale by the size of the non-face region to normalize the loss
+        loss = F.l1_loss(source_non_face, target_non_face, reduction='sum') / (non_face_masks.sum() + 1e-6)
+        
+        # Apply weight from options
+        weighted_loss = loss * self.opt.lambda_non_face_preservation
+        
+        # Create visualization of non-face mask
+        if self.non_face_mask_vis is None:
+            self.non_face_mask_vis = self.colorize_mask(non_face_masks, source)
+        
+        return weighted_loss

@@ -314,6 +314,115 @@ def load_checkpoint(model, optimizer, checkpoint_path, device):
     print(f"Loaded checkpoint from epoch {epoch}")
     return epoch, losses
 
+def predict_and_update(model, data_json, device):
+    """
+    Predict attributes for incomplete items in the data and update the file
+    """
+    print("Loading data for prediction...")
+    with open(data_json, 'r') as f:
+        data = json.load(f)
+    
+    # Find incomplete items
+    incomplete_items = {}
+    for img_path, annotation in data['annotations'].items():
+        if not annotation.get('is_completed', False):
+            incomplete_items[img_path] = annotation
+
+    if not incomplete_items:
+        print("No incomplete items found in the dataset.")
+        return
+    
+    print(f"Found {len(incomplete_items)} incomplete items for prediction.")
+    
+    # Set up transform
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    
+    # Create inverse map for quality score
+    quality_score_inverse_map = {v: k for k, v in QUALITY_SCORE_MAP.items()}
+    
+    # Define threshold ranges for quality score to label conversion
+    quality_thresholds = {
+        (0.0, 0.05): "not_rate",
+        (0.05, 0.25): "bad",
+        (0.25, 0.75): "average",
+        (0.75, 1.1): "good"
+    }
+    
+    # Set model to evaluation mode
+    model.eval()
+    
+    # Process each incomplete item
+    print("Processing incomplete items...")
+    with torch.no_grad():
+        for img_path, annotation in tqdm(incomplete_items.items()):
+            try:
+                # Load and transform image
+                image = Image.open(annotation['image_path']).convert('RGB')
+                image_tensor = transform(image).unsqueeze(0).to(device)
+                
+                # Get model predictions
+                outputs = model(image_tensor)
+                
+                # Convert predictions to attribute values
+                predictions = {}
+                for attr, pred in outputs.items():
+                    if attr == "quality_score":
+                        # Keep the float value
+                        value = pred[0].item()
+                        predictions["quality_score_float"] = value
+                        
+                        # Convert to label based on thresholds
+                        label = None
+                        for (lower, upper), label_name in quality_thresholds.items():
+                            if lower <= value < upper:
+                                label = label_name
+                                break
+                        
+                        if label is None:
+                            label = "not_rate"  # Default fallback
+                        
+                        predictions["quality_score"] = label
+                    else:
+                        # Classification tasks - get the class with highest probability
+                        _, predicted_class = torch.max(pred[0], 0)
+                        pred_idx = predicted_class.item()
+                        
+                        # Get the label name from the inverse map
+                        if attr == "skin_tone":
+                            inverse_map = {v: k for k, v in SKIN_TONE_MAP.items()}
+                        elif attr == "eye_color":
+                            inverse_map = {v: k for k, v in EYE_COLOR_MAP.items()}
+                        elif attr == "gender":
+                            inverse_map = {v: k for k, v in GENDER_MAP.items()}
+                        elif attr == "facial_hair":
+                            inverse_map = {v: k for k, v in FACIAL_HAIR_MAP.items()}
+                        elif attr == "has_glasses":
+                            inverse_map = {v: k for k, v in HAS_GLASSES_MAP.items()}
+                        elif attr == "has_necklace":
+                            inverse_map = {v: k for k, v in HAS_NECKLACE_MAP.items()}
+                        elif attr == "lip_color":
+                            inverse_map = {v: k for k, v in LIP_COLOR_MAP.items()}
+                        
+                        predictions[attr] = inverse_map[pred_idx]
+                
+                # Update the annotation with predictions
+                for attr, value in predictions.items():
+                    annotation[attr] = value
+                
+            except Exception as e:
+                print(f"Error processing {img_path}: {e}")
+    
+    # Save the updated data
+    print("Saving updated annotations...")
+    with open(data_json, 'w') as f:
+        json.dump(data, f, indent=2)
+    
+    print(f"Updated {len(incomplete_items)} items in {data_json}")
+
 def main():
     parser = argparse.ArgumentParser(description='Train facial attribute classifier')
     parser.add_argument('--data', type=str, required=True, help='Path to the data JSON file')
@@ -323,6 +432,8 @@ def main():
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints', help='Directory to save checkpoints')
     parser.add_argument('--load_checkpoint', type=str, default=None, help='Path to load checkpoint from')
     parser.add_argument('--save_every', type=int, default=1, help='Save checkpoint every N epochs')
+    parser.add_argument('--predict', action='store_true', help='Run in prediction mode to update incomplete annotations')
+    parser.add_argument('--model_path', type=str, help='Path to the model for prediction mode')
     
     args = parser.parse_args()
     
@@ -333,6 +444,26 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
+    if args.predict:
+        # Run in prediction mode
+        if not args.model_path:
+            print("Error: --model_path is required for prediction mode")
+            return
+        
+        print(f"Running in prediction mode with model: {args.model_path}")
+        
+        # Create model
+        model = AttributeClassifier(ATTRIBUTE_SIZES)
+        model.to(device)
+        
+        # Load the model
+        model.load_state_dict(torch.load(args.model_path, map_location=device))
+        
+        # Run prediction and update data
+        predict_and_update(model, args.data, device)
+        return
+    
+    # Training mode
     # Data transforms
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
