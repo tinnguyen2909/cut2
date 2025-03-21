@@ -70,6 +70,9 @@ def get_params(opt, size):
     elif opt.preprocess == 'scale_width_and_crop':
         new_w = opt.load_size
         new_h = opt.load_size * h // w
+    elif opt.preprocess == "scale_height_and_crop":
+        new_h = opt.load_size
+        new_w = opt.load_size * w // h
 
     x = random.randint(0, np.maximum(0, new_w - opt.crop_size))
     y = random.randint(0, np.maximum(0, new_h - opt.crop_size))
@@ -94,6 +97,8 @@ def get_transform(opt, params=None, grayscale=False, method=Image.BICUBIC, conve
         transform_list.append(transforms.Lambda(lambda img: __scale_width(img, opt.load_size, opt.crop_size, method)))
     elif 'scale_shortside' in opt.preprocess:
         transform_list.append(transforms.Lambda(lambda img: __scale_shortside(img, opt.load_size, opt.crop_size, method)))
+    elif 'scale_height' in opt.preprocess:
+        transform_list.append(transforms.Lambda(lambda img: __scale_height(img, opt.load_size, opt.crop_size, method)))
 
     if 'zoom' in opt.preprocess:
         if params is None:
@@ -186,6 +191,15 @@ def __scale_width(img, target_width, crop_width, method=Image.BICUBIC):
         return img
     w = target_width
     h = int(max(target_width * oh / ow, crop_width))
+    return img.resize((w, h), method)
+
+
+def __scale_height(img, target_height, crop_height, method=Image.BICUBIC):
+    ow, oh = img.size
+    if oh == target_height and ow >= crop_height:
+        return img
+    h = target_height
+    w = int(max(target_height * ow / oh, crop_height))
     return img.resize((w, h), method)
 
 
