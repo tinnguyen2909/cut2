@@ -94,7 +94,7 @@ class UnalignedDataset(BaseDataset):
             # Check if A image path matches the pattern
             if hasattr(self.opt, 'enable_scale_on') and re.search(self.opt.enable_scale_on, A_path):
                 # Random scale factor between 0.33 and 0.9
-                scale_factor = random.uniform(0.33, 0.9)
+                scale_factor = random.uniform(0.3, 0.9)
                 # Get original size
                 orig_width, orig_height = A_img.size
                 # Calculate new size
@@ -102,19 +102,36 @@ class UnalignedDataset(BaseDataset):
                 new_height = int(orig_height * scale_factor)
                 # Resize image
                 scaled_img = A_img.resize((new_width, new_height), Image.LANCZOS)
+                
                 # Create white background
                 white_bg = Image.new('RGB', (orig_width, orig_height), (255, 255, 255))
-                # Calculate position to center the scaled image
-                paste_x = (orig_width - new_width) // 2
-                paste_y = (orig_height - new_height) // 2
-                # Paste scaled image onto white background
-                white_bg.paste(scaled_img, (paste_x, paste_y))
+                
+                if scale_factor <= 0.5:
+                    # Calculate how many images can fit in rows and columns
+                    num_cols = max(1, int(orig_width / new_width))
+                    num_rows = max(1, int(orig_height / new_height))
+                    
+                    # Distribute scaled images across the canvas
+                    for row in range(num_rows):
+                        for col in range(num_cols):
+                            paste_x = col * new_width
+                            paste_y = row * new_height
+                            # Ensure we don't exceed the canvas dimensions
+                            if paste_x + new_width <= orig_width and paste_y + new_height <= orig_height:
+                                white_bg.paste(scaled_img, (paste_x, paste_y))
+                else:
+                    # Calculate position to center the scaled image
+                    paste_x = (orig_width - new_width) // 2
+                    paste_y = (orig_height - new_height) // 2
+                    # Paste scaled image onto white background
+                    white_bg.paste(scaled_img, (paste_x, paste_y))
+                
                 A_img = white_bg
                 
             # Check if B image path matches the pattern
             if hasattr(self.opt, 'enable_scale_on') and re.search(self.opt.enable_scale_on, B_path):
-                # Random scale factor between 0.33 and 0.9
-                scale_factor = random.uniform(0.33, 0.6)
+                # Random scale factor between 0.33 and 0.6
+                scale_factor = random.uniform(0.3, 0.6)
                 # Get original size
                 orig_width, orig_height = B_img.size
                 # Calculate new size
@@ -122,13 +139,30 @@ class UnalignedDataset(BaseDataset):
                 new_height = int(orig_height * scale_factor)
                 # Resize image
                 scaled_img = B_img.resize((new_width, new_height), Image.LANCZOS)
+                
                 # Create white background
                 white_bg = Image.new('RGB', (orig_width, orig_height), (255, 255, 255))
-                # Calculate position to center the scaled image
-                paste_x = (orig_width - new_width) // 2
-                paste_y = (orig_height - new_height) // 2
-                # Paste scaled image onto white background
-                white_bg.paste(scaled_img, (paste_x, paste_y))
+                
+                if scale_factor <= 0.5:
+                    # Calculate how many images can fit in rows and columns
+                    num_cols = max(1, int(orig_width / new_width))
+                    num_rows = max(1, int(orig_height / new_height))
+                    
+                    # Distribute scaled images across the canvas
+                    for row in range(num_rows):
+                        for col in range(num_cols):
+                            paste_x = col * new_width
+                            paste_y = row * new_height
+                            # Ensure we don't exceed the canvas dimensions
+                            if paste_x + new_width <= orig_width and paste_y + new_height <= orig_height:
+                                white_bg.paste(scaled_img, (paste_x, paste_y))
+                else:
+                    # Calculate position to center the scaled image
+                    paste_x = (orig_width - new_width) // 2
+                    paste_y = (orig_height - new_height) // 2
+                    # Paste scaled image onto white background
+                    white_bg.paste(scaled_img, (paste_x, paste_y))
+                
                 B_img = white_bg
         
         # Apply random rotation if enabled
