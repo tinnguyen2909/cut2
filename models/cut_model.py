@@ -6,6 +6,7 @@ from .patchnce import PatchNCELoss
 import util.util as util
 import torch.nn.functional as F
 import os
+import cv2
 
 
 class CUTModel(BaseModel):
@@ -91,6 +92,15 @@ class CUTModel(BaseModel):
         parser.add_argument('--lambda_non_face_color', type=float, default=0.0, 
                            help='weight for preserving colors in non-face regions')
 
+        # Add InsightFace-based identity preservation options
+        parser.add_argument('--lambda_identity', type=float, default=0.0,
+                           help='weight for identity preservation loss using InsightFace')
+        parser.add_argument('--use_insightface', type=util.str2bool, default=True,
+                           help='use InsightFace for identity preservation')
+        parser.add_argument('--insightface_model', type=str, default='buffalo_l',
+                           choices=['buffalo_l', 'buffalo_m', 'buffalo_s'],
+                           help='InsightFace model variant to use')
+
         opt, _ = parser.parse_known_args()
 
         # Set default parameters for CUT and FastCUT
@@ -114,6 +124,10 @@ class CUTModel(BaseModel):
         self.loss_names = ['G_GAN', 'D_real', 'D_fake', 'G', 'NCE']
         self.visual_names = ['real_A', 'fake_B', 'real_B']
         self.nce_layers = [int(i) for i in self.opt.nce_layers.split(',')]
+
+        # Add identity preservation loss name if enabled
+        if opt.lambda_identity > 0.0 and opt.use_insightface:
+            self.loss_names.append('identity')
 
         # Add face mask visualization if face preservation is enabled
         if opt.face_preservation and opt.lambda_face_preservation > 0.0:
@@ -235,6 +249,27 @@ class CUTModel(BaseModel):
             
             # Create visualization of non-face mask
             self.non_face_mask_vis = None
+
+        # Initialize InsightFace for identity preservation
+        self.insightface_model = None
+        if opt.lambda_identity > 0.0 and opt.use_insightface:
+            try:
+                from insightface.app import FaceAnalysis
+                from insightface.app.common import Face
+                import cv2
+                import numpy as np
+                
+                # Initialize InsightFace
+                self.insightface_model = FaceAnalysis(name=opt.insightface_model)
+                self.insightface_model.prepare(ctx_id=0, det_size=(640, 640))
+                print("InsightFace model loaded successfully")
+                
+                # Store face analysis results
+                self.face_analysis_cache = {}
+            except ImportError:
+                print("Warning: InsightFace not found. Identity preservation will be disabled.")
+                self.insightface_model = None
+                opt.use_insightface = False
 
     def data_dependent_initialize(self, data):
         """
@@ -614,6 +649,12 @@ class CUTModel(BaseModel):
             self.loss_background = self.compute_background_preservation_loss(self.real_A, self.fake_B) * self.opt.lambda_background
         else:
             self.loss_background = 0.0
+
+        # Calculate identity preservation loss using InsightFace
+        if self.opt.lambda_identity > 0.0 and self.opt.use_insightface:
+            self.loss_identity = self.compute_identity_preservation_loss(self.real_A, self.fake_B) * self.opt.lambda_identity
+        else:
+            self.loss_identity = 0.0
 
         # Add face preservation loss during stage 2 training
         if self.opt.face_preservation and hasattr(self, 'face_model_stage1'):
@@ -1238,3 +1279,90 @@ class CUTModel(BaseModel):
             self.non_face_mask_vis = self.colorize_mask(non_face_masks, source)
         
         return weighted_loss
+
+    def compute_identity_preservation_loss(self, source, target):
+        """Calculate identity preservation loss using InsightFace
+        
+        Args:
+            source (tensor): Source image tensor [B, C, H, W]
+            target (tensor): Target image tensor [B, C, H, W]
+            
+        Returns:
+            tensor: Identity preservation loss
+        """
+        if self.insightface_model is None:
+            return torch.tensor(0.0, device=source.device)
+            
+        batch_size = source.size(0)
+        total_loss = 0.0
+        
+        # Process each image in the batch
+        for i in range(batch_size):
+            # Convert tensors to numpy arrays (detach to avoid gradient computation)
+            src_img = source[i].detach().permute(1, 2, 0).cpu().numpy()
+            tgt_img = target[i].detach().permute(1, 2, 0).cpu().numpy()
+            
+            # Convert from [-1,1] to [0,255] range
+            src_img = ((src_img + 1) * 127.5).astype(np.uint8)
+            tgt_img = ((tgt_img + 1) * 127.5).astype(np.uint8)
+            
+            # Convert to BGR for OpenCV
+            src_img = cv2.cvtColor(src_img, cv2.COLOR_RGB2BGR)
+            tgt_img = cv2.cvtColor(tgt_img, cv2.COLOR_RGB2BGR)
+            
+            # First attempt at face detection
+            src_faces = self.insightface_model.get(src_img)
+            tgt_faces = self.insightface_model.get(tgt_img)
+            
+            # If face detection fails, try with resized image on white background
+            if len(src_faces) == 0 or len(tgt_faces) == 0:
+                # Create white backgrounds
+                h, w = src_img.shape[:2]
+                src_white_bg = np.ones((h, w, 3), dtype=np.uint8) * 255
+                tgt_white_bg = np.ones((h, w, 3), dtype=np.uint8) * 255
+                
+                # Resize images to 75% of original size
+                new_h, new_w = int(h * 0.6), int(w * 0.6)
+                src_resized = cv2.resize(src_img, (new_w, new_h))
+                tgt_resized = cv2.resize(tgt_img, (new_w, new_h))
+                
+                # Calculate padding to center the resized images
+                pad_h = (h - new_h) // 2
+                pad_w = (w - new_w) // 2
+                
+                # Paste resized images onto white backgrounds
+                src_white_bg[pad_h:pad_h+new_h, pad_w:pad_w+new_w] = src_resized
+                tgt_white_bg[pad_h:pad_h+new_h, pad_w:pad_w+new_w] = tgt_resized
+                
+                # Try face detection again
+                if len(src_faces) == 0:
+                    src_faces = self.insightface_model.get(src_white_bg)
+                if len(tgt_faces) == 0:
+                    tgt_faces = self.insightface_model.get(tgt_white_bg)
+            
+            # If we still have faces to compare
+            if len(src_faces) > 0 and len(tgt_faces) > 0:
+                # Get the largest face in each image
+                src_face = max(src_faces, key=lambda x: x.bbox[2] * x.bbox[3])
+                tgt_face = max(tgt_faces, key=lambda x: x.bbox[2] * x.bbox[3])
+                
+                # Calculate cosine similarity between face embeddings
+                similarity = np.dot(src_face.embedding, tgt_face.embedding) / (
+                    np.linalg.norm(src_face.embedding) * np.linalg.norm(tgt_face.embedding)
+                )
+                
+                # Convert similarity to loss (1 - similarity)
+                # Higher similarity means lower loss
+                face_loss = 1.0 - similarity
+                
+                # Add to total loss
+                total_loss += face_loss
+            else:
+                # If we still can't detect faces, add maximum loss
+                total_loss += 1.0
+        
+        # Average loss over batch
+        if batch_size > 0:
+            total_loss = total_loss / batch_size
+            
+        return torch.tensor(total_loss, device=source.device)
