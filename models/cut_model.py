@@ -7,6 +7,7 @@ import util.util as util
 import torch.nn.functional as F
 import os
 import cv2
+import lpips
 
 
 class CUTModel(BaseModel):
@@ -38,6 +39,10 @@ class CUTModel(BaseModel):
         parser.add_argument('--flip_equivariance',
                             type=util.str2bool, nargs='?', const=True, default=False,
                             help="Enforce flip-equivariance as additional regularization. It's used by FastCUT, but not CUT")
+        
+        # Add LPIPS loss option
+        parser.add_argument('--lambda_lpips', type=float, default=0.0, help='weight for LPIPS perceptual loss')
+        parser.add_argument('--lpips_net', type=str, default='vgg', choices=['alex', 'vgg'], help='network to use for LPIPS loss')
         
         # Add attention mechanism options
         parser.add_argument('--attention_layers', type=str, default="16,20", 
@@ -125,6 +130,10 @@ class CUTModel(BaseModel):
         self.visual_names = ['real_A', 'fake_B', 'real_B']
         self.nce_layers = [int(i) for i in self.opt.nce_layers.split(',')]
 
+        # Add LPIPS loss name if enabled
+        if opt.lambda_lpips > 0.0:
+            self.loss_names.append('lpips')
+
         # Add identity preservation loss name if enabled
         if opt.lambda_identity > 0.0 and opt.use_insightface:
             self.loss_names.append('identity')
@@ -178,6 +187,11 @@ class CUTModel(BaseModel):
                 self.criterionNCE.append(PatchNCELoss(opt).to(self.device))
 
             self.criterionIdt = torch.nn.L1Loss().to(self.device)
+            
+            # Initialize LPIPS loss if enabled
+            if opt.lambda_lpips > 0.0:
+                self.criterionLPIPS = lpips.LPIPS(net=opt.lpips_net).to(self.device)
+            
             self.optimizer_G = torch.optim.Adam(self.netG.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
             self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
             self.optimizers.append(self.optimizer_G)
@@ -643,6 +657,11 @@ class CUTModel(BaseModel):
         else:
             self.loss_ethnicity = 0.0
             
+        # Calculate LPIPS perceptual loss
+        if self.opt.lambda_lpips > 0.0:
+            self.loss_lpips = self.criterionLPIPS(self.real_A, self.fake_B).mean() * self.opt.lambda_lpips
+        else:
+            self.loss_lpips = 0.0
 
         # Calculate background preservation loss
         if self.opt.lambda_background > 0.0:
@@ -710,11 +729,11 @@ class CUTModel(BaseModel):
             # Add to total loss
             loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_eye +  \
                      self.loss_segmentation + self.loss_edge + self.loss_color + self.loss_ethnicity + \
-                     self.loss_background + self.loss_face_preservation
+                     self.loss_background + self.loss_face_preservation + self.loss_lpips
         else:
             loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_eye + \
                      self.loss_segmentation + self.loss_edge + self.loss_color + self.loss_ethnicity + \
-                     self.loss_background
+                     self.loss_background + self.loss_lpips
 
         # Add non-face preservation loss
         if self.opt.non_face_preservation and self.opt.lambda_non_face_preservation > 0.0:
