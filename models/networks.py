@@ -1016,7 +1016,8 @@ class ResnetGenerator(nn.Module):
                         
                         if XFORMERS_AVAILABLE:
                             # Use xformers memory-efficient attention
-                            self.attention_modules[f'attn_{layer_id}'] = xformers.ops.MemoryEfficientAttention()
+                            # We don't store the function itself, only the learnable projections
+                            pass # No module to store for the attention function itself
                         else:
                             # Fallback to regular attention with memory optimization
                             self.attention_modules[f'attn_{layer_id}'] = nn.MultiheadAttention(
@@ -1025,10 +1026,10 @@ class ResnetGenerator(nn.Module):
                                 batch_first=True
                             )
                         
-                        # Add layer normalization
+                        # Add layer normalization (always needed)
                         self.attention_modules[f'norm_{layer_id}'] = nn.LayerNorm(feature_dim)
                         
-                        # Add projection layers for query, key, value if using xformers
+                        # Add projection layers for query, key, value (only if using xformers)
                         if XFORMERS_AVAILABLE:
                             head_dim = feature_dim // self.attention_heads
                             self.attention_modules[f'q_proj_{layer_id}'] = nn.Linear(feature_dim, feature_dim)
@@ -1059,14 +1060,17 @@ class ResnetGenerator(nn.Module):
             v = v.reshape(b, -1, self.attention_heads, c // self.attention_heads).transpose(1, 2)
             
             # Apply memory-efficient attention
-            attn_output = self.attention_modules[f'attn_{layer_id}'](q, k, v)
+            attn_output = xformers.ops.memory_efficient_attention(q, k, v)
             
             # Reshape back
             attn_output = attn_output.transpose(1, 2).reshape(b, -1, c)
         else:
             # Use regular PyTorch attention with gradient checkpointing
+            # Fetch the MultiheadAttention module
+            attn_module = self.attention_modules[f'attn_{layer_id}']
             def attention_forward(*inputs):
-                return self.attention_modules[f'attn_{layer_id}'](*inputs)[0]
+                # Call the stored module
+                return attn_module(*inputs)[0]
             
             if self.training:
                 attn_output = torch.utils.checkpoint.checkpoint(
@@ -1076,8 +1080,9 @@ class ResnetGenerator(nn.Module):
             else:
                 attn_output = attention_forward(feat_reshaped, feat_reshaped, feat_reshaped)
         
-        # Apply layer norm
-        attn_output = self.attention_modules[f'norm_{layer_id}'](attn_output)
+        # Apply layer norm (always needed)
+        norm_module = self.attention_modules[f'norm_{layer_id}']
+        attn_output = norm_module(attn_output)
         
         # Reshape back to original shape: [B, H*W, C] -> [B, C, H, W]
         attn_output = attn_output.permute(0, 2, 1).reshape(b, c, h, w)
