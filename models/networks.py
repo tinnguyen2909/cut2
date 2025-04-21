@@ -7,6 +7,14 @@ from torch.optim import lr_scheduler
 import numpy as np
 from .stylegan_networks import StyleGAN2Discriminator, StyleGAN2Generator, TileStyleGAN2Discriminator
 
+try:
+    import xformers
+    import xformers.ops
+    XFORMERS_AVAILABLE = True
+except ImportError:
+    XFORMERS_AVAILABLE = False
+    print("xformers not available - for more efficient attention please install xformers")
+
 ###############################################################################
 # Helper Functions
 ###############################################################################
@@ -990,7 +998,6 @@ class ResnetGenerator(nn.Module):
         self.attention_layers = []
         self.use_attention = False
         if opt is not None and hasattr(opt, 'attention_layers') and opt.attention_layers:
-            # Only enable attention if use_attention is True (default False)
             if hasattr(opt, 'use_attention') and opt.use_attention:
                 self.use_attention = True
                 self.attention_layers = [int(l) for l in opt.attention_layers.split(',')]
@@ -1002,25 +1009,80 @@ class ResnetGenerator(nn.Module):
                     if layer_id < len(model):
                         # Get the channel size at this layer
                         with torch.no_grad():
-                            dummy_input = torch.zeros(1, input_nc, 256, 256)  # Example size
+                            dummy_input = torch.zeros(1, input_nc, 256, 256)
                             for l in range(layer_id):
                                 dummy_input = model[l](dummy_input)
                             feature_dim = dummy_input.shape[1]
                         
-                        # Create MultiheadAttention module
-                        self.attention_modules[f'attn_{layer_id}'] = nn.MultiheadAttention(
-                            embed_dim=feature_dim,
-                            num_heads=self.attention_heads,
-                            batch_first=True
-                        )
+                        if XFORMERS_AVAILABLE:
+                            # Use xformers memory-efficient attention
+                            self.attention_modules[f'attn_{layer_id}'] = xformers.ops.MemoryEfficientAttention()
+                        else:
+                            # Fallback to regular attention with memory optimization
+                            self.attention_modules[f'attn_{layer_id}'] = nn.MultiheadAttention(
+                                embed_dim=feature_dim,
+                                num_heads=self.attention_heads,
+                                batch_first=True
+                            )
                         
-                        # Add layer normalization for better attention stability
+                        # Add layer normalization
                         self.attention_modules[f'norm_{layer_id}'] = nn.LayerNorm(feature_dim)
                         
-                print(f"Initialized attention on layers {self.attention_layers} with {self.attention_heads} heads per layer")
+                        # Add projection layers for query, key, value if using xformers
+                        if XFORMERS_AVAILABLE:
+                            head_dim = feature_dim // self.attention_heads
+                            self.attention_modules[f'q_proj_{layer_id}'] = nn.Linear(feature_dim, feature_dim)
+                            self.attention_modules[f'k_proj_{layer_id}'] = nn.Linear(feature_dim, feature_dim)
+                            self.attention_modules[f'v_proj_{layer_id}'] = nn.Linear(feature_dim, feature_dim)
+                
+                print(f"Initialized {'xformers' if XFORMERS_AVAILABLE else 'regular'} attention on layers {self.attention_layers}")
             else:
                 print("Attention layers defined but attention is disabled (use_attention=False)")
                 self.use_attention = False
+
+    def apply_attention(self, feat, layer_id):
+        # Save original shape
+        b, c, h, w = feat.shape
+        
+        # Reshape for attention: [B, C, H, W] -> [B, H*W, C]
+        feat_reshaped = feat.flatten(2).permute(0, 2, 1)
+        
+        if XFORMERS_AVAILABLE:
+            # Apply xformers memory-efficient attention
+            q = self.attention_modules[f'q_proj_{layer_id}'](feat_reshaped)
+            k = self.attention_modules[f'k_proj_{layer_id}'](feat_reshaped)
+            v = self.attention_modules[f'v_proj_{layer_id}'](feat_reshaped)
+            
+            # Reshape for xformers attention
+            q = q.reshape(b, -1, self.attention_heads, c // self.attention_heads).transpose(1, 2)
+            k = k.reshape(b, -1, self.attention_heads, c // self.attention_heads).transpose(1, 2)
+            v = v.reshape(b, -1, self.attention_heads, c // self.attention_heads).transpose(1, 2)
+            
+            # Apply memory-efficient attention
+            attn_output = self.attention_modules[f'attn_{layer_id}'](q, k, v)
+            
+            # Reshape back
+            attn_output = attn_output.transpose(1, 2).reshape(b, -1, c)
+        else:
+            # Use regular PyTorch attention with gradient checkpointing
+            def attention_forward(*inputs):
+                return self.attention_modules[f'attn_{layer_id}'](*inputs)[0]
+            
+            if self.training:
+                attn_output = torch.utils.checkpoint.checkpoint(
+                    attention_forward,
+                    feat_reshaped, feat_reshaped, feat_reshaped
+                )
+            else:
+                attn_output = attention_forward(feat_reshaped, feat_reshaped, feat_reshaped)
+        
+        # Apply layer norm
+        attn_output = self.attention_modules[f'norm_{layer_id}'](attn_output)
+        
+        # Reshape back to original shape: [B, H*W, C] -> [B, C, H, W]
+        attn_output = attn_output.permute(0, 2, 1).reshape(b, c, h, w)
+        
+        return attn_output
 
     def forward(self, input, layers=[], encode_only=False):
         if -1 in layers:
@@ -1034,36 +1096,16 @@ class ResnetGenerator(nn.Module):
                 
                 # Apply attention if this is an attention layer
                 if self.use_attention and layer_id in self.attention_layers:
-                    # Save original shape
-                    b, c, h, w = feat.shape
-                    
-                    # Reshape for attention: [B, C, H, W] -> [B, H*W, C]
-                    feat_reshaped = feat.flatten(2).permute(0, 2, 1)
-                    
-                    # Apply attention - query, key, value are the same for self-attention
-                    attn_output, _ = self.attention_modules[f'attn_{layer_id}'](
-                        feat_reshaped, feat_reshaped, feat_reshaped
-                    )
-                    
-                    # Apply layer norm
-                    attn_output = self.attention_modules[f'norm_{layer_id}'](attn_output)
-                    
-                    # Reshape back to original shape: [B, H*W, C] -> [B, C, H, W]
-                    attn_output = attn_output.permute(0, 2, 1).reshape(b, c, h, w)
-                    
-                    # Residual connection
+                    attn_output = self.apply_attention(feat, layer_id)
                     feat = feat + attn_output
                 
                 if layer_id in layers:
                     feats.append(feat)
                 if layer_id == layers[-1] and encode_only:
                     return feats
-                
             return feat, feats
         else:
-            """Standard forward"""
             if not self.use_attention:
-                # Fast path when no attention is used
                 return self.model(input)
             
             # Apply layers with attention
@@ -1073,24 +1115,7 @@ class ResnetGenerator(nn.Module):
                 
                 # Apply attention if this is an attention layer
                 if layer_id in self.attention_layers:
-                    # Save original shape
-                    b, c, h, w = feat.shape
-                    
-                    # Reshape for attention: [B, C, H, W] -> [B, H*W, C]
-                    feat_reshaped = feat.flatten(2).permute(0, 2, 1)
-                    
-                    # Apply attention - query, key, value are the same for self-attention
-                    attn_output, _ = self.attention_modules[f'attn_{layer_id}'](
-                        feat_reshaped, feat_reshaped, feat_reshaped
-                    )
-                    
-                    # Apply layer norm
-                    attn_output = self.attention_modules[f'norm_{layer_id}'](attn_output)
-                    
-                    # Reshape back to original shape: [B, H*W, C] -> [B, C, H, W]
-                    attn_output = attn_output.permute(0, 2, 1).reshape(b, c, h, w)
-                    
-                    # Residual connection
+                    attn_output = self.apply_attention(feat, layer_id)
                     feat = feat + attn_output
             
             return feat
